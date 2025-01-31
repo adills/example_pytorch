@@ -11,6 +11,7 @@ matplotlib = "*"
 jupyter = "*"
 nbconvert = "*"
 pandoc = "*"
+scikit-learn = "*"
 
 [dev-packages]
 
