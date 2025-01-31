@@ -93,7 +93,7 @@ class PINNTrainer:
             
             batch_t, batch_x, batch_y = next(iter(self.train_loader))
             batch_t = batch_t.clone().detach().requires_grad_(True)
-            print(f"Batch size: {len(batch_x)}")
+            # print(f"Batch size: {len(batch_x)}")
             # Forward pass and compute loss
             output = self.model(batch_t)
             x_pred, y_pred = output.chunk(2, dim=-1)
@@ -108,15 +108,15 @@ class PINNTrainer:
             res_y = dydt + x_pred + 2 * y_pred
             
             loss_residuals = (res_x ** 2).mean() + (res_y ** 2).mean()
-            print(f"Loss: residual = {loss_residuals:6f}")
+            # print(f"Loss: residual = {loss_residuals:6f}")
 
             # Initial Conditions Loss
             ic_loss = (x_pred[0] - 1) ** 2 + (y_pred[0] - 0) ** 2
-            print(f"Loss: IC = {ic_loss.item():6f}")
+            # print(f"Loss: IC = {ic_loss.item():6f}")
             
             # Data Loss
             data_loss = loss_data((batch_x, batch_y), (x_pred, y_pred))
-            print(f"Loss: Data = {data_loss.item():6f}")
+            # print(f"Loss: Data = {data_loss.item():6f}")
             
             total_loss = loss_residuals + ic_loss + data_loss
             
