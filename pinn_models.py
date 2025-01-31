@@ -18,6 +18,22 @@ def solution(t):
     y_t = 0.5 * (-1*np.exp(-t) + np.exp(-3*t))
     return x_t, y_t
 
+def loss_data(data, pred):
+    """
+    Data Loss Function: Computes the mean squared error (MSE)
+    between data and predictions across all dimensions.
+    
+    Parameters:
+    - data (torch.Tensor): Ground truth values.
+    - pred (torch.Tensor): Predicted values.
+
+    Returns:
+    - torch.Tensor: The computed MSE loss.
+    """
+    # Compute mean squared error across all dimensions
+    loss_data = torch.mean((data - pred) ** 2)
+    return loss_data
+
 class PINN(nn.Module):
     def __init__(self, hidden_size=64, output_size=2):
         super(PINN, self).__init__()
