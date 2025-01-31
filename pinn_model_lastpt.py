@@ -68,7 +68,12 @@ class PINN(nn.Module):
 class PINNDataset(Dataset):
     """ Modify PINNDataset to exclude data where  $t > \text{threshold}$ :"""
     def __init__(self, t, x, y, threshold=None):
-        mask = t <= threshold if threshold is not None else np.ones_like(t, dtype=bool)
+        t, x, y = np.array(t), np.array(x), np.array(y)  # Ensure numpy arrays
+
+        # Create mask correctly for 1D arrays
+        mask = (t <= threshold) if threshold is not None else np.ones_like(t, dtype=bool)
+
+        # Apply mask properly to 1D arrays
         self.x = to_tensor(x[mask])
         self.y = to_tensor(y[mask])
         self.t = to_tensor(t[mask])
