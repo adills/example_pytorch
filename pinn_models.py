@@ -133,7 +133,8 @@ class PINNTrainer:
             with torch.no_grad():
                 output = self.model(t)
                 analytical = solution(t)
-                x_test_sol, y_test_sol = analytical[:,0], analytical[:,1]
+                analytical = np.column_stack(analytical)  # Convert tuple (x_t, y_t) into an array
+                x_test_sol, y_test_sol = analytical[:, 0], analytical[:, 1]  # Now it works!
                 # analytical = torch.stack([to_tensor(analytical[:,0]), to_tensor(analytical[:,1])], dim=-1)
                 x_pred, y_pred = output.chunk(2, dim=-1)
                 # convert a PyTorch tensor to a NumPy array with .cpu().numpy()
