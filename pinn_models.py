@@ -1,3 +1,4 @@
+import numpy as np
 import torch
 from torch import nn
 from torch.utils.data import Dataset
@@ -9,6 +10,13 @@ def to_tensor(array, dtype=torch.float32):
     if isinstance(array, torch.Tensor):
         return array
     return torch.tensor(array, dtype=dtype)
+
+# Truth solution
+def solution(t):
+    t = np.asarray(t)  # Ensure it's a standard ndarray
+    x_t = 0.5 * (np.exp(-t) + np.exp(-3*t))
+    y_t = 0.5 * (-1*np.exp(-t) + np.exp(-3*t))
+    return x_t, y_t
 
 class PINN(nn.Module):
     def __init__(self, hidden_size=64, output_size=2):
@@ -62,14 +70,17 @@ class PINNTrainer:
             self.model.zero_grad()
             
             batch_t, batch_x, batch_y = next(iter(self.train_loader))
+            batch_t = batch_t.clone().detach().requires_grad_(True)
             print(f"Batch size: {len(batch_x)}")
             # Forward pass and compute loss
             output = self.model(batch_t)
             x_pred, y_pred = output.chunk(2, dim=-1)
             
             # Compute residuals
-            dxdt = torch.autograd.grad(x_pred, batch_t, create_graph=True)[0]
-            dydt = torch.autograd.grad(y_pred, batch_t, create_graph=True)[0]
+            # dxdt = torch.autograd.grad(x_pred, batch_t, create_graph=True)[0]
+            # dydt = torch.autograd.grad(y_pred, batch_t, create_graph=True)[0]
+            dxdt = torch.autograd.grad(x_pred, batch_t, grad_outputs=torch.ones_like(x_pred), create_graph=True)[0]
+            dydt = torch.autograd.grad(y_pred, batch_t, grad_outputs=torch.ones_like(y_pred), create_graph=True)[0]
             
             res_x = dxdt + 2 * x_pred + y_pred
             res_y = dydt + x_pred + 2 * y_pred
