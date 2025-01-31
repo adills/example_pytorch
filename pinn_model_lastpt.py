@@ -53,6 +53,9 @@ class PINN(nn.Module):
         self.out_layer = nn.Linear(hidden_size, output_size)
 
     def forward(self, t):
+        if len(t.shape) == 1:  
+            t = t.unsqueeze(-1)  # Ensure t has shape (batch_size, 1)
+        
         x = torch.sin(t)  # Assuming t is in radians
         x = self.in_layer(x)
         x = self.h1(x)
