@@ -24,15 +24,21 @@ def loss_data(data, pred):
     between data and predictions across all dimensions.
     
     Parameters:
-    - data (torch.Tensor): Ground truth values.
-    - pred (torch.Tensor): Predicted values.
+    - data (tuple of torch.Tensor): Ground truth values (e.g., (x_true, y_true)).
+    - pred (tuple of torch.Tensor): Predicted values (e.g., (x_pred, y_pred)).
 
     Returns:
     - torch.Tensor: The computed MSE loss.
     """
-    # Compute mean squared error across all dimensions
-    loss_data = torch.mean((data - pred) ** 2)
-    return loss_data
+    # Unpack tuples
+    data_x, data_y = data
+    pred_x, pred_y = pred
+
+    # Compute MSE separately for both components and sum
+    loss_x = torch.mean((data_x - pred_x) ** 2)
+    loss_y = torch.mean((data_y - pred_y) ** 2)
+
+    return loss_x + loss_y
 
 class PINN(nn.Module):
     def __init__(self, hidden_size=64, output_size=2):
