@@ -102,6 +102,7 @@ class PINNTrainer:
         # print(f'train_loader.dataset[2] = {train_loader.dataset[2]}')
 
     def train(self, num_epochs=4000):
+        total_loss_epoch = []
         for epoch in range(num_epochs):
             self.model.zero_grad()
             
@@ -136,10 +137,13 @@ class PINNTrainer:
             
             # Backpropagation and optimization
             total_loss.backward()
+            total_loss_epoch.append(total_loss)
             self.optimizer.step()
             
             if epoch % 500 == 0:
                 print(f"Epoch {epoch} Loss: {total_loss.item():6f}")
+            
+        self.total_loss_epoch
     
     def test(self):
         predictions = []
