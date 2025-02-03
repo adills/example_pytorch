@@ -143,7 +143,7 @@ class PINNTrainer:
             if epoch % 500 == 0:
                 print(f"Epoch {epoch} Loss: {total_loss.item():6f}")
             
-        self.total_loss_epoch
+        self.total_loss_epoch = total_loss_epoch
     
     def test(self):
         predictions = []
