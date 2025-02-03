@@ -137,7 +137,7 @@ class PINNTrainer:
             
             # Backpropagation and optimization
             total_loss.backward()
-            total_loss_epoch.append(total_loss)
+            total_loss_epoch.append(total_loss.detach().cpu().numpy())
             self.optimizer.step()
             
             if epoch % 500 == 0:
