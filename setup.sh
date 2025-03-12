@@ -1,4 +1,5 @@
 # setup for a PyTorch environment to use GPU
+# System specific torch installs described at https://pytorch.org/get-started/locally/
 
 # make sure xcode is installed
 xcode-select -v
