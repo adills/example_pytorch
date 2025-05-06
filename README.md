@@ -15,4 +15,6 @@ Physics Informed Neutral Networks, and many varieties there in, have gaining tra
 
 my examples are inspired from various examples that I've found in academic literature, GitHub repositories, and Medium articles.  my documentation is limited but I try to property reference the materials I used within the code itself. 
 
-I'm currently working an example using a system of linear ordinary differential (ODE) equations similar to a couples spring mass system. I started with a basic PINN that determines the displacements that over the ODEs. and I'm working a variety of extensions from there.  The with is being done in the `sysEqns.ipynb` notebook and later will be incorporated into one or more `.py` files.
+I have two examples using a system of linear ordinary differential (ODE) equations similar to a couples spring mass system: 
+1. I started with a basic PINN that determines the displacements that over the ODEs (`sysEqns.ipynb` and `sysEqns.py`).  
+2. Next, I examined the performance of a Neural ODE in which the shooting method is used to predict the ending point (`neural_ODE.ipynb` and `neural_ODE.py`).
