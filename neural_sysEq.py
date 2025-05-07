@@ -44,6 +44,20 @@ import matplotlib.pyplot as plt
 # %%
 device = 'cpu'
 
+# For model:
+hidden_size = [128,128,128] # [64,  64]
+activation_fn = torch.nn.SiLU # torch.nn.Tanh
+dropout_rate = 0
+# odefunc implements f_phys + f_NN
+integrator = 'dopri5' #'rk4'
+test_integrator = 'rk4'
+int_options = {'rtol':1e-3, 'atol':1e-4} # for dopri5 integrator
+
+# For loss:
+λ_cont = 1e-1 # 1.0
+λ_ic = 1e-2
+λ_colloc = 1e-2  # weight for midpoint collocation loss
+
 # %% [markdown]
 # ## Definitions
 
@@ -77,7 +91,8 @@ def ic(u, x0, y0):
 
 
 def create_sequential_model(input_size: int = 1, hidden_layers: list = [64, 64],
-                            output_size: int = 6, activation=torch.nn.ReLU):
+                            output_size: int = 6, activation=torch.nn.ReLU,
+                            dropout_rate: float = 0.2):
     """
     Creates a sequential neural network model.
 
@@ -103,7 +118,7 @@ def create_sequential_model(input_size: int = 1, hidden_layers: list = [64, 64],
         layers.append(torch.nn.Linear(prev_size, size))
         layers.append(activation())
         prev_size = size
-    layers.append(torch.nn.Dropout(0.2))
+    layers.append(torch.nn.Dropout(dropout_rate))
     layers.append(torch.nn.Linear(prev_size, output_size))
     return torch.nn.Sequential(*layers)
 
@@ -112,7 +127,8 @@ class MODEL(torch.nn.Module):
     """Neural network for 6-dimensional outputs with enhanced dimension handling"""
 
     def __init__(self, input_size=1, hidden_size=[64, 64], output_size=6,
-                 activation=torch.nn.ReLU, dtype=torch.float32):
+                 activation=torch.nn.ReLU, dtype=torch.float32,
+                 dropout_rate=0.2):
         """ NN models considered:
         input_size=1, hidden_size=[64, 64], output_size=6, activation=nn.ReLU : does not converge
         input_size=1, hidden_size=[64, 64], output_size=6, activation=nn.Tanh
@@ -122,7 +138,8 @@ class MODEL(torch.nn.Module):
         self.net = create_sequential_model(input_size=input_size,
                                            hidden_layers=hidden_size,
                                            output_size=output_size,
-                                           activation=activation)
+                                           activation=activation,
+                                           dropout_rate=dropout_rate)
         # Number of output features (6 in your case)
         self.n_outputs = output_size
         self.dtype = dtype
@@ -214,9 +231,11 @@ with torch.no_grad():
 
 # The network input size must match [state_dim + 1] for (x, y, time)
 model = MODEL(input_size=state_dim + 1,
-              hidden_size=[64, 64],
+              hidden_size=hidden_size,# [64, 64],
               output_size=state_dim,
-              activation=torch.nn.Tanh).to(device)
+              activation=activation_fn,# torch.nn.Tanh
+              dropout_rate=dropout_rate
+              ).to(device)
 odefunc = ODEFunc(model)
 
 # %% [markdown]
@@ -224,16 +243,15 @@ odefunc = ODEFunc(model)
 
 # %%
 
-# odefunc implements f_phys + f_NN
-integrator = 'rk4'#'dopri15'
 
-def integrate_segment(odefunc, s_k, t_start, t_end):
-    t_seg = torch.tensor([t_start, t_end], device=device)
-    ys = odeint(odefunc, s_k, t_seg,
-            method=integrator,
-            options={'rtol':1e-3, 'atol':1e-4})
-    # ys: [2, batch, state_dim]; return start & end
-    return ys[0], ys[1]
+
+# def integrate_segment(odefunc, s_k, t_start, t_end):
+#     t_seg = torch.tensor([t_start, t_end], device=device)
+#     ys = odeint(odefunc, s_k, t_seg,
+#             method=integrator,
+#             options=int_options)
+#     # ys: [2, batch, state_dim]; return start & end
+#     return ys[0], ys[1]
 
 # %% [markdown]
 # ### (b) Training loop with multiple-shooting
@@ -277,8 +295,9 @@ for epoch in range(num_epochs):
             odefunc,
             y0_batch,
             t_seg,
-            method=integrator,
-            options={'rtol': 1e-3, 'atol': 1e-4}
+            rtol=int_options['rtol'],
+            atol=int_options['atol'],
+            method=integrator
         )
     # ys = odeint(
     #     odefunc,
@@ -316,9 +335,12 @@ for epoch in range(num_epochs):
         ys_mid = odeint(odefunc, y0_batch, t_mid_tensor, method='rk4')
     else:
         ys_mid = odeint(
-            odefunc, y0_batch, t_mid_tensor,
-            method=integrator,
-            options={'rtol': 1e-3, 'atol': 1e-4}
+            odefunc,
+            y0_batch,
+            t_mid_tensor,
+            rtol=int_options['rtol'],
+            atol=int_options['atol'],
+            method=integrator
         )
     y_mid = ys_mid[1].view(K, batch_size, state_dim)
     # Predicted derivative at mids via model+physics
@@ -364,7 +386,7 @@ for epoch in range(num_epochs):
     colloc_losses.append(colloc_loss.item())
 
     if epoch % print_every == 0:
-        print(f"Epoch {epoch}: loss = {loss.item():.4f}")
+        print(f"Epoch {epoch}: loss = {loss.item():.4e}")
 
 # %% [markdown]
 # After training, plot the losses:
@@ -391,6 +413,7 @@ plt.stackplot(
 # Overlay total loss line
 total_losses = [f + c + ic + colloc for f, c, ic, colloc in zip(fit_losses, cont_losses, ic_losses, colloc_losses)]
 plt.plot(epochs, total_losses, label='Total Loss')
+plt.yscale('log')  # use a log scale on the y-axis for the combined loss plot
 plt.xlabel('Epoch')
 plt.ylabel('Loss')
 plt.legend(loc='upper right')
@@ -406,18 +429,18 @@ epochs_end = list(range(len(x_end_preds)))
 fig, (ax3, ax4) = plt.subplots(1, 2, figsize=(12, 4))
 
 # x endpoint
-ax3.plot(epochs_end, x_end_preds, label='Predicted x(tN)')
+ax3.plot(epochs_end, x_end_preds, label='Predicted x(tN)', color='blue')
 ax3.hlines(x_true_final, 0, len(epochs_end)-1,
-           linestyles='--', label='True x(tN)')
+           linestyles='--', label='True x(tN)', color='red')
 ax3.set_xlabel('Epoch')
 ax3.set_ylabel('x endpoint')
 ax3.set_title('Convergence of x endpoint')
 ax3.legend()
 
 # y endpoint
-ax4.plot(epochs_end, y_end_preds, label='Predicted y(tN)')
+ax4.plot(epochs_end, y_end_preds, label='Predicted y(tN)', color='blue')
 ax4.hlines(y_true_final, 0, len(epochs_end)-1,
-           linestyles='--', label='True y(tN)')
+           linestyles='--', label='True y(tN)', color='red')
 ax4.set_xlabel('Epoch')
 ax4.set_ylabel('y endpoint')
 ax4.set_title('Convergence of y endpoint')
@@ -429,7 +452,7 @@ plt.show()
 # 5) Now generate a high-resolution prediction on your test times:
 with torch.no_grad():
     # assume s[0] is your learned initial state at t0
-    y_test_pred = odeint(odefunc, s[0], t_test, method=integrator).squeeze(1)
+    y_test_pred = odeint(odefunc, s[0], t_test, method=test_integrator).squeeze(1)
     # y_test_pred: [len(t_test), state_dim]
 
 # unpack predictions and true solution
@@ -450,16 +473,16 @@ y_seg_boundaries = y_seg_boundaries.cpu()
 # Combined x(t) and y(t) subplots
 fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
 # Left subplot: x(t)
-ax1.plot(t_vals, x_true, label='True x(t)')
-ax1.plot(t_vals, x_pred, label='Predicted x(t)')
+ax1.plot(t_vals, x_true, label='True x(t)', color='red')
+ax1.plot(t_vals, x_pred, label='Predicted x(t)', color='blue')
 ax1.plot(t_seg_cpu, x_seg_boundaries, linestyle='None', marker='o', label='Segment boundaries')
 ax1.set_xlabel('Time')
 ax1.set_ylabel('x')
 ax1.set_title('Spring-Mass: x(t) True vs Predicted')
 ax1.legend()
 # Right subplot: y(t)
-ax2.plot(t_vals, y_true, label='True y(t)')
-ax2.plot(t_vals, y_pred, label='Predicted y(t)')
+ax2.plot(t_vals, y_true, label='True y(t)', color='red')
+ax2.plot(t_vals, y_pred, label='Predicted y(t)', color='blue')
 ax2.plot(t_seg_cpu, y_seg_boundaries, linestyle='None', marker='o', label='Segment boundaries')
 ax2.set_xlabel('Time')
 ax2.set_ylabel('y')
