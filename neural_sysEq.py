@@ -45,11 +45,11 @@ import matplotlib.pyplot as plt
 device = 'cpu'
 
 # For model:
-hidden_size = [128,128,128] # [64,  64]
+hidden_size = [128,64,128,64,128,64] # [64,  64]
 activation_fn = torch.nn.SiLU # torch.nn.Tanh
 dropout_rate = 0
 # odefunc implements f_phys + f_NN
-integrator = 'dopri5' #'rk4'
+integrator = 'rk4'#'dopri5' #'rk4'
 test_integrator = 'rk4'
 int_options = {'rtol':1e-3, 'atol':1e-4} # for dopri5 integrator
 
@@ -57,6 +57,11 @@ int_options = {'rtol':1e-3, 'atol':1e-4} # for dopri5 integrator
 λ_cont = 1e-1 # 1.0
 λ_ic = 1e-2
 λ_colloc = 1e-2  # weight for midpoint collocation loss
+# Endpoint loss weight and tracker
+λ_end = 1e-2        # weight for overall endpoint loss
+
+num_epochs = 400
+print_every = 50
 
 # %% [markdown]
 # ## Definitions
@@ -256,10 +261,6 @@ odefunc = ODEFunc(model)
 # %% [markdown]
 # ### (b) Training loop with multiple-shooting
 
-
-num_epochs = 2000
-print_every = 100
-
 # OPTIMIZER
 # optimizer = torch.optim.Adam(list(model.parameters()) + [s], lr=1e-3)
 # Use AdamW for weight decay and a cosine LR schedule for smooth annealing
@@ -271,12 +272,12 @@ fit_losses = []
 cont_losses = []
 ic_losses = []       # track initial-condition loss
 colloc_losses = []   # track collocation loss
+end_losses = []     # track endpoint loss per epoch
+
 # Track predicted endpoints at tN per epoch
 x_end_preds = []   # track predicted x endpoint at tN per epoch
 y_end_preds = []   # track predicted y endpoint at tN per epoch
-λ_cont = 1.0
-λ_ic = 1e-2
-λ_colloc = 1e-2  # weight for midpoint collocation loss
+
 
 for epoch in range(num_epochs):
     optimizer.zero_grad()
@@ -309,10 +310,28 @@ for epoch in range(num_epochs):
     # ys: [2, K*batch, state_dim] → take end point then reshape → [K, batch, state_dim]
     y_end = ys[1].view(K, batch_size, state_dim)
     # Record predicted endpoint at final segment
+    # y_end[-1] grabs the end state of the last segment (segment index K-1), 
+    #           giving a tensor of shape [batch_size, state_dim]
+    # y_end[-1, 0] then selects the 0-th batch entry (since batch_size == 1): 
+    #           [state_dim] This is the complete state vector 
+    #           [x(t_N),\,y(t_N)] predicted at the very end of your time horizon.
+    # y_end[-1, 0, 0] and y_end[-1, 0, 1] index further into that 2-vector to 
+    #           pull out the individual components:
+    #   •	y_end[-1,0,0] → the x–coordinate at t_N,
+    #   •	y_end[-1,0,1] → the y–coordinate at t_N.
     x_pred_end = y_end[-1, 0, 0].item()
     y_pred_end = y_end[-1, 0, 1].item()
     x_end_preds.append(x_pred_end)
     y_end_preds.append(y_pred_end)
+
+    # Compute overall endpoint loss at tN using the final segment prediction
+    x_true_end, y_true_end = solution([tN])  # ground truth at final time
+    # pack into a 1D tensor of shape [state_dim]
+    y_true_end_tensor = torch.stack([x_true_end, y_true_end], dim=-1).squeeze(0).to(device)
+    # predicted endpoint from last segment
+    pred_end = y_end[-1, 0]  # shape [state_dim]
+    # mean squared error between predicted and true endpoint
+    end_loss = (pred_end - y_true_end_tensor).pow(2).mean()
 
     # Data-fit: true end-points at each segment boundary
     x_true_seg, y_true_seg = solution(t_grid[1:])  # both tensors shape [K]
@@ -350,31 +369,14 @@ for epoch in range(num_epochs):
     phys_mid = torch.stack(eom(y_mid), dim=-1)
     colloc_loss = (dydt_pred_mid - phys_mid).pow(2).mean()
 
-    # Total loss and optimization, include collocation penalty
-    # loss = fit_loss + λ_cont * cont_loss
-    loss = fit_loss + λ_cont * cont_loss + λ_ic * ic_loss + λ_colloc * colloc_loss
-
-    # predictions = []
-    # continuity_losses = []
-    # for k in range(K):
-    #     t_start, t_end = t_grid[k].item(), t_grid[k+1].item()
-    #     s_k = s[k]
-    #     y_start, y_end = integrate_segment(odefunc, s_k, t_start, t_end)
-
-    #     # True solution at segment end
-    #     x_true, y_true = solution(t_end)
-    #     y_true_end = torch.stack([x_true, y_true], dim=-1)
-    #     predictions.append((y_end, y_true_end))
-
-    #     # Continuity penalty between segments
-    #     if k < K-1:
-    #         continuity_losses.append((y_end - s[k+1]).pow(2).mean())
-
-    # # Compute losses
-    # fit_loss = sum((yp - yt).pow(2).mean() for yp, yt in predictions)
-    # λ_cont = 1.0
-    # cont_loss = λ_cont * sum(continuity_losses)
-    # loss = fit_loss + cont_loss
+    # include endpoint penalty
+    loss = (
+        fit_loss
+        + λ_cont * cont_loss
+        + λ_ic * ic_loss
+        + λ_colloc * colloc_loss
+        + λ_end * end_loss
+    )
 
     # Backprop and update
     loss.backward()
@@ -384,6 +386,7 @@ for epoch in range(num_epochs):
     cont_losses.append(cont_loss.item())
     ic_losses.append(ic_loss.item())
     colloc_losses.append(colloc_loss.item())
+    end_losses.append(end_loss.item())
 
     if epoch % print_every == 0:
         print(f"Epoch {epoch}: loss = {loss.item():.4e}")
@@ -399,25 +402,46 @@ for epoch in range(num_epochs):
 # 	    2.	True vs. predicted x‐trajectory,
 # 	    3.	True vs. predicted y‐trajectory.
 
-epochs = list(range(len(fit_losses)))
 
-plt.figure()
-plt.stackplot(
+# Combined loss visualizations: stacked (left) and individual lines (right)
+epochs = list(range(len(fit_losses)))
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+
+# Left: stacked-area plot of all losses
+ax1.stackplot(
     epochs,
     fit_losses,
     cont_losses,
     ic_losses,
     colloc_losses,
-    labels=['Fit Loss','Continuity Loss','IC Loss','Collocation Loss']
+    end_losses,
+    labels=['Fit Loss', 'Continuity Loss', 'IC Loss', 'Collocation Loss', 'Endpoint Loss']
 )
 # Overlay total loss line
-total_losses = [f + c + ic + colloc for f, c, ic, colloc in zip(fit_losses, cont_losses, ic_losses, colloc_losses)]
-plt.plot(epochs, total_losses, label='Total Loss')
-plt.yscale('log')  # use a log scale on the y-axis for the combined loss plot
-plt.xlabel('Epoch')
-plt.ylabel('Loss')
-plt.legend(loc='upper right')
-plt.title('Training Losses (Stacked)')
+total_losses = [
+    f + c + ic + colloc + e
+    for f, c, ic, colloc, e in zip(fit_losses, cont_losses, ic_losses, colloc_losses, end_losses)
+]
+ax1.plot(epochs, total_losses, label='Total Loss', color='black', linewidth=1.5)
+ax1.set_yscale('log')
+ax1.set_xlabel('Epoch')
+ax1.set_ylabel('Loss (log scale)')
+ax1.set_title('Training Losses (Stacked)')
+ax1.legend(loc='upper right')
+
+# Right: individual loss component lines
+ax2.plot(epochs, fit_losses,    label='Fit Loss')
+ax2.plot(epochs, cont_losses,   label='Continuity Loss')
+ax2.plot(epochs, ic_losses,     label='IC Loss')
+ax2.plot(epochs, colloc_losses, label='Collocation Loss')
+ax2.plot(epochs, end_losses,    label='Endpoint Loss')
+ax2.set_yscale('log')
+ax2.set_xlabel('Epoch')
+ax2.set_ylabel('Loss (log scale)')
+ax2.set_title('Training Losses (Individual)')
+ax2.legend(loc='upper right')
+
+plt.tight_layout()
 plt.show()
 
 # Plot convergence of predicted endpoints
