@@ -1,39 +1,39 @@
 # %% [markdown]
-# # Neural ODE with Multi-Shooting for Coupled Spring–Mass System
-#
-# This script demonstrates a **physics-informed Neural ODE** that integrates known equations of motion for a coupled spring–mass system alongside a small neural network correction. Key features and workflow:
-#
-# 1. **Multi-Shooting Segmentation**  
-#    - Split the interval \([t_0, t_N]\) into \(K\) segments.  
-#    - Each segment has its own trainable initial state, warm-started with the analytic solution.  
-#
-# 2. **Physics + Neural Correction**  
-#    - Define `eom(y)` for the known system dynamics.  
-#    - Wrap a `MODEL` network to learn residual forces.  
-#    - Combine them in `ODEFunc.forward(t, y)` and integrate via `torchdiffeq.odeint`.
-#
-# 3. **Composite Loss Function**  
-#    - **Physics**: enforce the neural ODE to learn the system ODE at the segment mid-points
-#    - **Data-Fit**: match predicted segment-end states to observed data at boundaries.  
-#    - **Continuity**: enforce smooth transitions between segments.  
-#    - **Initial-Condition Penalty**: anchor the first segment to the true start state.  
-#    - **Collocation**: penalize ODE residual at each segment midpoint.  
-#
-# 4. **Training Setup**  
-#    - Optimizer: AdamW with weight decay.  
-#    - LR Scheduler: Cosine annealing over `num_epochs`.  
-#    - Solver: fixed-step RK4 for efficiency (or adaptive Dormand–Prince).  
-#
-# 5. **Visualization**  
-#    - **Stacked loss plot**: breakdown of all loss components plus total.  
-#    - **Endpoint convergence**: predicted vs. true final-state over epochs.  
-#    - **Trajectory comparison**: true vs. predicted \(x(t)\) & \(y(t)\), with segment-boundary markers.
-#
-# **Usage:**  
-# - Adjust `K`, epoch count, and loss weights (`λ_cont`, `λ_ic`, `λ_colloc`) to suit your data.  
-# - Run the script as-is to train and visualize results.  
-# - Replace the analytic `solution(t)` with real observations at segment times to fit measured data.
+"""Neural ODE with Multi-Shooting for Coupled Spring–Mass System
 
+This script demonstrates a **physics-informed Neural ODE** that integrates known equations of motion for a coupled spring–mass system alongside a small neural network correction. Key features and workflow:
+
+1. **Multi-Shooting Segmentation**  
+   - Split the interval \([t_0, t_N]\) into \(K\) segments.  
+   - Each segment has its own trainable initial state, warm-started with the analytic solution.  
+
+2. **Physics + Neural Correction**  
+   - Define `eom(y)` for the known system dynamics.  
+   - Wrap a `MODEL` network to learn residual forces.  
+   - Combine them in `ODEFunc.forward(t, y)` and integrate via `torchdiffeq.odeint`.
+
+3. **Composite Loss Function**  
+   - **Physics**: enforce the neural ODE to learn the system ODE at the segment mid-points
+   - **Data-Fit**: match predicted segment-end states to observed data at boundaries.  
+   - **Continuity**: enforce smooth transitions between segments.  
+   - **Initial-Condition Penalty**: anchor the first segment to the true start state.  
+   - **Collocation**: penalize ODE residual at each segment midpoint.  
+
+4. **Training Setup**  
+   - Optimizer: AdamW with weight decay.  
+   - LR Scheduler: Cosine annealing over `num_epochs`.  
+   - Solver: fixed-step RK4 for efficiency (or adaptive Dormand–Prince).  
+
+5. **Visualization**  
+   - **Stacked loss plot**: breakdown of all loss components plus total.  
+   - **Endpoint convergence**: predicted vs. true final-state over epochs.  
+   - **Trajectory comparison**: true vs. predicted \(x(t)\) & \(y(t)\), with segment-boundary markers.
+
+**Usage:**  
+- Adjust `K`, epoch count, and loss weights (`λ_cont`, `λ_ic`, `λ_colloc`) to suit your data.  
+- Run the script as-is to train and visualize results.  
+- Replace the analytic `solution(t)` with real observations at segment times to fit measured data.
+"""
 # %% [markdown]
 # ## Set up libaries
 
