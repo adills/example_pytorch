@@ -57,3 +57,72 @@ This modification enhances traditional PINNs by making them more tractable for s
 I have two examples using a system of linear ordinary differential (ODE) equations similar to a couples spring mass system: 
 1. I started with a basic PINN that determines the displacements that over the ODEs (`sysEqns.ipynb` and `sysEqns.py`).  
 2. Next, I examined the performance of a Neural ODE in which the shooting method is used to predict the ending point (`neural_sysEq.ipynb` and `neural_sysEq.py`).
+3. The `neural_sysEq_parameters.py` incorporates a more general coupled spring-mass system
+that allows the user to define the masses, spring coefficients, and dampening terms.
+
+## Neural ODEs with Fourier spectral loss constraints. 
+The more general coupled spring-mass system as in `neural_sysEq_parameters.py` proved
+to be very difficult to solve using the traditional Neural ODE approach.  So I explored
+additional Fourier methods in `neural_sysEq_parameters_ft.py`.  Here is a summary of the
+changes I made:
+
+Here’s a high-level changelog of what I tried—each tweak, why I did it, and its net impact:
+1.	Modular refactor
+- Introduced parse_args(), create_data(), a Trainer class, and standalone plot functions
+- Effect: Clean CLI, easy hyperparameter control, and clear separation of data prep, training, and visualization.
+2.	Unified physics‐only solve
+- In create_data(), solve the ODE once over t_grid∪t_test and slice out both sets
+- Effect: Guarantees true states at segment knots exactly match the test trajectory—no more interpolation drift.
+3.	Multi‐shooting architecture
+- Trainable segment initial states s[k], plus losses:
+	- 	fit_loss (match each segment’s end to true state)
+	- 	cont_loss (continuity between segments)
+	- 	colloc_loss (ODE‐residual at midpoints)
+	- 	end_loss (track final endpoint error)
+- Effect: Robust “divide‐and‐conquer” integration that can capture complex trajectories segment‐by‐segment.
+4.	Denser collocation
+- Switched from a single midpoint to 5 interior collocation points per segment
+- Boosted λ_colloc → 1.0
+- Effect: Stronger enforcement of the physics ODE in between boundary points, reducing mid‐segment drift.
+5.	Energy‐dissipation regularizer
+- Added compute_energy(u) and penalized any increase in mechanical energy over time
+- Controlled by λ_energy
+- Effect: Physically anchors the network to the true damped behavior—suppresses non-physical overshoots.
+6.	Fourier‐feature embedding
+- FFT of the true x₁(t) to auto-select dominant frequencies
+- Augmented MLP input with sinusoids at those modes
+- Effect: Gave the network an explicit basis for high-frequency ripples, boosting its ability to fit fine oscillations.
+7.	Spectral‐loss curriculum (and log-magnitude)
+- Introduced magnitude & phase FFT‐losses on x₁ and x₂, ramped in over the first 50% of epochs
+- Switched to log-magnitude to cap dynamic range
+- Effect: Initially improved frequency alignment but tended to destabilize training when fully on—so we later dialed it back.
+8.	Learnable Fourier phase & amplitude
+- Replaced fixed sin/cos embeddings with trainable φᵢ and Aᵢ per mode
+- Reduced input size accordingly (only sine needed)
+- Effect: Allowed direct, low-dimensional correction of phase/amplitude offsets—faster convergence on spectral alignment.
+9.	Adaptive optimizer & scheduler
+- Separate AdamW groups:
+    - φ/A at lr = 1e-2, no decay
+    - rest + segment states at lr = 1e-3, weight decay
+- CosineAnnealingLR over all epochs (ηₘᵢₙ = 1e-5)
+- Effect: Stabilized training by cooling the LR continuously, especially as spectral losses kicked in.
+10.	Gradient clipping
+- Clipped all grads to max‐norm 1.0 after backward()
+- Effect: Prevented runaway updates when some loss terms spiked.
+11.	SIREN architecture
+- Added a Sine activation and let --activation_fn=SIREN replace SiLU/Tanh
+- Effect: Provided an inherent oscillatory basis throughout the network—further improved capture of both envelope and ripples.
+12.	Light‐touch phase tuning
+- Lowered λ_spec_phase and λ_spec_phase2 to 1e-3
+- After half the epochs, froze φ/A (requires_grad=False) and early-stopped if phase loss rose
+- Effect: Kept the model from “over-chasing” tiny phase errors once the bulk of the dynamics were learned.
+
+⸻
+
+Net outcome:
+-   Envelope & ripples are now captured with sub-percent endpoint errors.
+- 	Physical damping is enforced via energy regularization.
+- 	High-frequency details are modeled through SIREN + Fourier features.
+- 	Training stability is maintained by curriculum, adaptive LR, and gradient clipping.
+
+Together they demonstrate a systematic progression from a vanilla PINN to a finely‐tuned, physics‐aligned Neural ODE.
