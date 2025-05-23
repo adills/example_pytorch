@@ -42,6 +42,9 @@ import torch
 from os import cpu_count
 from torchdiffeq import odeint
 import matplotlib.pyplot as plt
+# Add tqdm for progress bar
+from tqdm import tqdm
+import math
 # Number of *logical* CPUs (hyperthreads included)
 n_logical = cpu_count()
 torch.set_num_threads(n_logical)
@@ -62,7 +65,7 @@ def parse_args():
     parser.add_argument("--activation_fn", type=str, choices=["SiLU", "Tanh", "SIREN"], default="SIREN",
                         help="Activation function: SiLU, Tanh, or SIREN")
     parser.add_argument("--dropout_rate", type=float, default=0.0)
-    parser.add_argument("--integrator", type=str, choices=["rk4", "dopri5"], default="rk4")
+    parser.add_argument("--integrator", type=str, choices=["rk4", "dopri5"], default="dopri5")
     parser.add_argument("--test_integrator", type=str, choices=["rk4", "dopri5"], default="rk4")
     parser.add_argument("--rtol", type=float, default=1e-3, help="Relative tolerance for dopri5")
     parser.add_argument("--atol", type=float, default=1e-4, help="Absolute tolerance for dopri5")
@@ -75,8 +78,8 @@ def parse_args():
     parser.add_argument("--lambda_spec_mag2",   type=float, default=0.01, help="Spectral magnitude loss weight for x2")
     parser.add_argument("--lambda_spec_phase2", type=float, default=0.001, help="Spectral phase loss weight for x2")
     parser.add_argument("--lambda_energy", type=float, default=1e-3, help="Energy dissipation loss weight")
-    parser.add_argument("--num_epochs", type=int, default=200, help="Number of epochs to run")
-    parser.add_argument("--print_every", type=int, default=50, help="Print epoch loss values at these intervales")
+    parser.add_argument("--num_epochs", type=int, default=100, help="Number of epochs to run")
+    parser.add_argument("--print_every", type=int, default=10, help="Print epoch loss values at these intervales")
     parser.add_argument("--t0", type=float, default=0.0, help="Start time")
     parser.add_argument("--tN", type=float, default=10.0, help="End time")
     parser.add_argument("--K", type=int, default=20, help="Number of segments")
@@ -377,6 +380,7 @@ class Trainer:
         self.ic_losses = []
         self.colloc_losses = []
         self.end_losses = []
+        self.total_losses = []
         self.x1_end_preds = []
         self.x2_end_preds = []
         self.spec_mag_losses = []
@@ -391,7 +395,8 @@ class Trainer:
         ramp_epochs = args.num_epochs // 2
         true_grid_states = self.true_grid_states
         true_test_states = self.true_test_states
-        for epoch in range(args.num_epochs):
+        pbar = tqdm(range(args.num_epochs), desc='Training', unit='epoch')
+        for epoch in pbar:
             # Reset gradients
             self.optimizer.zero_grad()
             # Flatten segment initial states into batch for ODE solver
@@ -561,14 +566,16 @@ class Trainer:
             self.optimizer.step()
             # Update learning rate schedule
             self.scheduler.step()
+            # Update tqdm with loss
+            pbar.set_postfix(loss=loss.item())
+            self.total_losses.append(loss.item())
             self.fit_losses.append(fit_loss.item())
             self.cont_losses.append(cont_loss.item())
             self.ic_losses.append(ic_loss.item())
             self.colloc_losses.append(colloc_loss.item())
             self.end_losses.append(end_loss.item())
-            # Optionally print loss information
-            if epoch % args.print_every == 0:
-                print(f"Epoch {epoch}: loss = {loss.item():.4e}")
+        # Print summarized losses at specified intervals
+        self.print_loss_table()
         return (
             self.fit_losses,
             self.cont_losses,
@@ -582,6 +589,39 @@ class Trainer:
             self.spec_mag_losses2,
             self.spec_phase_losses2
         )
+
+    def print_loss_table(self):
+        import math
+        loss_dict = {
+            'Fit': self.fit_losses,
+            'Cont': self.cont_losses,
+            'IC': self.ic_losses,
+            'Colloc': self.colloc_losses,
+            'End': self.end_losses,
+            'Total': self.total_losses
+        }
+        # Determine order of magnitude for each loss type
+        exps = {}
+        for name, losses in loss_dict.items():
+            max_val = max(losses) if losses else 0
+            exp = int(math.floor(math.log10(max_val))) if max_val > 0 else 0
+            exps[name] = exp
+        # Build header with scale factors
+        header = f"{'Epoch':>5}"
+        for name in loss_dict.keys():
+            # Align header labels to match 13-character data columns (space + 12 width)
+            header += f"{name}(1e{exps[name]:d})".rjust(13)
+        print("\nLoss summary:")
+        print(header)
+        # Print rows at intervals
+        for i in range(len(self.total_losses)):
+            if i % self.args.print_every == 0:
+                row = f"{i:5d}"
+                for name, losses in loss_dict.items():
+                    scale = 10 ** exps[name] if exps[name] != 0 else 1
+                    val = losses[i] / scale
+                    row += f" {val:12.3f}"
+                print(row)
 
 # ---- Plotting functions ----
 def plot_losses(fit_losses, cont_losses, ic_losses, colloc_losses, end_losses):
