@@ -730,16 +730,10 @@ def plot_trajectories(odefunc, s, t_test, t_grid, args):
     plt.tight_layout()
     plt.show()
 
-
-# ---- Main function ----
-def main():
-    args = parse_args()
-    data = create_data(args)
-    trainer = Trainer(args, data)
-    fit_losses, cont_losses, ic_losses, colloc_losses, end_losses, x1_end_preds, x2_end_preds, spec_mag_losses, spec_phase_losses, spec_mag_losses2, spec_phase_losses2 = trainer.train()
-    plot_losses(fit_losses, cont_losses, ic_losses, colloc_losses, end_losses)
-    plot_endpoint_convergence(x1_end_preds, x2_end_preds, t_test=trainer.t_test, args=args)
-    plot_trajectories(trainer.odefunc, trainer.s, trainer.t_test, trainer.t_grid, args)
+def plot_spectral_losses(spec_mag_losses, 
+                         spec_phase_losses, 
+                         spec_mag_losses2, 
+                         spec_phase_losses2):
     # Optionally plot spectral losses
     plt.figure()
     plt.plot(spec_mag_losses, label="Spectral Magnitude Loss (x1)")
@@ -750,6 +744,17 @@ def main():
     plt.legend()
     plt.title("Spectral Losses")
     plt.show()
+
+# ---- Main function ----
+def main():
+    args = parse_args()
+    data = create_data(args)
+    trainer = Trainer(args, data)
+    fit_losses, cont_losses, ic_losses, colloc_losses, end_losses, x1_end_preds, x2_end_preds, spec_mag_losses, spec_phase_losses, spec_mag_losses2, spec_phase_losses2 = trainer.train()
+    plot_losses(fit_losses, cont_losses, ic_losses, colloc_losses, end_losses)
+    plot_endpoint_convergence(x1_end_preds, x2_end_preds, t_test=trainer.t_test, args=args)
+    plot_trajectories(trainer.odefunc, trainer.s, trainer.t_test, trainer.t_grid, args)
+    plot_spectral_losses(spec_mag_losses, spec_phase_losses, spec_mag_losses2, spec_phase_losses2)
 
 
 if __name__ == "__main__":
