@@ -418,27 +418,52 @@ def plot_losses(fit_losses, cont_losses, ic_losses, colloc_losses, end_losses):
     plt.tight_layout()
     plt.show()
 
-def plot_endpoint_convergence(x1_end_preds, x2_end_preds, tN, args):
-    # Compute true endpoint via physics-only solution
-    t_end_tensor = torch.tensor([tN], dtype=torch.float32, device=args.device)
-    x1_ts, y1_ts, x2_ts, y2_ts = solution(t_end_tensor, args)
-    x1_true_final = x1_ts.item()
-    x2_true_final = x2_ts.item()
+# def plot_endpoint_convergence(x1_end_preds, x2_end_preds, tN, args):
+#     # Compute true endpoint via physics-only solution
+#     t_end_tensor = torch.tensor([tN], dtype=torch.float32, device=args.device)
+#     x1_ts, y1_ts, x2_ts, y2_ts = solution(t_end_tensor, args)
+#     x1_true_final = x1_ts.item()
+#     x2_true_final = x2_ts.item()
+#     epochs_end = list(range(len(x1_end_preds)))
+#     fig, (ax3, ax4) = plt.subplots(1, 2, figsize=(12, 4))
+#     ax3.plot(epochs_end, x1_end_preds, label='Predicted x(tN)', color='blue')
+#     ax3.hlines(x1_true_final, 0, len(epochs_end)-1,
+#                linestyles='--', label='True x(tN)', color='red')
+#     ax3.set_xlabel('Epoch')
+#     ax3.set_ylabel('x endpoint')
+#     ax3.set_title('Convergence of x endpoint')
+#     ax3.legend()
+#     ax4.plot(epochs_end, x2_end_preds, label='Predicted y(tN)', color='blue')
+#     ax4.hlines(x2_true_final, 0, len(epochs_end)-1,
+#                linestyles='--', label='True y(tN)', color='red')
+#     ax4.set_xlabel('Epoch')
+#     ax4.set_ylabel('y endpoint')
+#     ax4.set_title('Convergence of y endpoint')
+#     ax4.legend()
+#     plt.tight_layout()
+#     plt.show()
+
+def plot_endpoint_convergence(x1_end_preds, x2_end_preds, t_test, args):
+    # Compute true solution over the full t_test grid and pick the final point
+    t_test_tensor = t_test.to(args.device)
+    x1_ts, y1_ts, x2_ts, y2_ts = solution(t_test_tensor, args)
+    x1_true_final = x1_ts[-1].item()
+    x2_true_final = x2_ts[-1].item()
     epochs_end = list(range(len(x1_end_preds)))
     fig, (ax3, ax4) = plt.subplots(1, 2, figsize=(12, 4))
     ax3.plot(epochs_end, x1_end_preds, label='Predicted x(tN)', color='blue')
     ax3.hlines(x1_true_final, 0, len(epochs_end)-1,
-               linestyles='--', label='True x(tN)', color='red')
+               linestyles='--', label='True x1(tN)', color='red')
     ax3.set_xlabel('Epoch')
-    ax3.set_ylabel('x endpoint')
-    ax3.set_title('Convergence of x endpoint')
+    ax3.set_ylabel('x1 endpoint')
+    ax3.set_title('Convergence of x1 endpoint')
     ax3.legend()
-    ax4.plot(epochs_end, x2_end_preds, label='Predicted y(tN)', color='blue')
+    ax4.plot(epochs_end, x2_end_preds, label='Predicted x2(tN)', color='blue')
     ax4.hlines(x2_true_final, 0, len(epochs_end)-1,
-               linestyles='--', label='True y(tN)', color='red')
+               linestyles='--', label='True x2(tN)', color='red')
     ax4.set_xlabel('Epoch')
-    ax4.set_ylabel('y endpoint')
-    ax4.set_title('Convergence of y endpoint')
+    ax4.set_ylabel('x2 endpoint')
+    ax4.set_title('Convergence of x2 endpoint')
     ax4.legend()
     plt.tight_layout()
     plt.show()
@@ -537,7 +562,7 @@ def main():
     trainer = Trainer(args, data)
     fit_losses, cont_losses, ic_losses, colloc_losses, end_losses, x1_end_preds, x2_end_preds = trainer.train()
     plot_losses(fit_losses, cont_losses, ic_losses, colloc_losses, end_losses)
-    plot_endpoint_convergence(x1_end_preds, x2_end_preds, tN=args.tN, args=args)
+    plot_endpoint_convergence(x1_end_preds, x2_end_preds, t_test=trainer.t_test, args=args)
     plot_trajectories(trainer.odefunc, trainer.s, trainer.t_test, trainer.t_grid, args)
 
 
