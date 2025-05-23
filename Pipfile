@@ -13,6 +13,7 @@ nbconvert = "*"
 pandoc = "*"
 scikit-learn = "*"
 torchdiffeq = "*"
+tqdm = "*"
 
 [dev-packages]
 
