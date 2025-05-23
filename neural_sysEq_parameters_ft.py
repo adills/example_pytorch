@@ -75,7 +75,7 @@ def parse_args():
     parser.add_argument("--lambda_spec_mag2",   type=float, default=0.01, help="Spectral magnitude loss weight for x2")
     parser.add_argument("--lambda_spec_phase2", type=float, default=0.001, help="Spectral phase loss weight for x2")
     parser.add_argument("--lambda_energy", type=float, default=1e-3, help="Energy dissipation loss weight")
-    parser.add_argument("--num_epochs", type=int, default=800, help="Number of epochs to run")
+    parser.add_argument("--num_epochs", type=int, default=200, help="Number of epochs to run")
     parser.add_argument("--print_every", type=int, default=50, help="Print epoch loss values at these intervales")
     parser.add_argument("--t0", type=float, default=0.0, help="Start time")
     parser.add_argument("--tN", type=float, default=10.0, help="End time")
