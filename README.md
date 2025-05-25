@@ -126,3 +126,45 @@ Net outcome:
 - 	Training stability is maintained by curriculum, adaptive LR, and gradient clipping.
 
 Together they demonstrate a systematic progression from a vanilla PINN to a finely‐tuned, physics‐aligned Neural ODE.
+
+## Neural ODEs with Fourier spectral loss constraints and Reduction of Training Data
+
+This version, implemented in `neural_sysEq_parameters_ft_reduxtime.py`, extends the Fourier-constrained Neural ODE approach by evaluating model performance under **progressively reduced training time horizons**.
+
+### Purpose
+
+The key idea is to:
+- Train multiple models, each on a truncated segment of the original time series (ending at `tN - k*delta_t`).
+- Still **evaluate all models at the original final time `tN`**, and compare the predicted end values to the ground truth.
+- Capture both **error** and **uncertainty** (via MC-dropout) as functions of the amount of time removed.
+
+This allows you to analyze how much future accuracy can be preserved when training on less data—critical for real-time or limited-sensor applications.
+
+### Features
+
+- Uses the same NeuralODE + Fourier + SIREN model architecture as the full-data version.
+- Adds a `Trainer.train_incremental()` method that:
+  - Iteratively reduces the training data's end time.
+  - Retrains the model on each reduced dataset from scratch.
+  - Evaluates all models at the full original `tN`.
+  - Logs absolute error and uncertainty of the final point prediction.
+- Plots include:
+  - Error vs. time removed (with uncertainty bands).
+  - 3D surface and heatmap of endpoint loss across epochs and truncations.
+- Automatically saves all plots as PNG images.
+
+### How to Run
+
+You can run the script with default arguments:
+
+```bash
+python neural_sysEq_parameters_ft_reduxtime.py
+```
+
+Or override the defaults to specify a longer final time, fewer training epochs, and a time step reduction of 1:
+
+```bash
+python neural_sysEq_parameters_ft_reduxtime.py --num_epochs 50 --delta_t 1 --tN 20
+```
+
+These will generate plots and save PNGs summarizing model accuracy and uncertainty across various data reduction levels.
