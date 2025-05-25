@@ -51,6 +51,8 @@ from mpl_toolkits.mplot3d import Axes3D
 n_logical = cpu_count()
 torch.set_num_threads(n_logical)
 torch.set_num_interop_threads(n_logical)
+import pprint
+pp = pprint.PrettyPrinter(indent=4)
 
 # ---- SIREN/Sine activation ----
 class Sine(torch.nn.Module):
@@ -88,6 +90,13 @@ def parse_args():
                         help="Time decrement for each iteration when truncating the time domain")
     parser.add_argument("--mc_runs", type=int, default=20,
                         help="Number of MC-dropout runs to estimate endpoint uncertainty")
+    parser.add_argument(
+        "--no-showplot",
+        action="store_false",
+        dest="showplot",
+        default=True,
+        help="Disable interactive display of plots"
+    )
     parser.add_argument("--K", type=int, default=20, help="Number of segments")
     parser.add_argument("--batch_size", type=int, default=1, help="Batch size")
     parser.add_argument("--state_dim", type=int, default=4, help="State dimension")
@@ -447,8 +456,14 @@ class Trainer:
                     u_pred = u_pred.squeeze(1)
                 mc_preds1.append(u_pred[-1, 0].item())
                 mc_preds2.append(u_pred[-1, 2].item())
-            unc1 = float(np.std(mc_preds1))
-            unc2 = float(np.std(mc_preds2))
+            # Compute uncertainty of the endpoint error via MC-dropout samples
+            # Error samples = predicted sample minus true endpoint
+            x1_true_full = self.true_test_states[-1, 0, 0].item()
+            x2_true_full = self.true_test_states[-1, 0, 2].item()
+            err_samples1 = [pred - x1_true_full for pred in mc_preds1]
+            err_samples2 = [pred - x2_true_full for pred in mc_preds2]
+            unc1 = float(np.std(err_samples1))
+            unc2 = float(np.std(err_samples2))
             # Continuous prediction at the original end time (tN)
             u_full = odeint(tr.odefunc, tr.s[0], full_t_test,
                             rtol=tr.args.rtol, atol=tr.args.atol,
@@ -714,7 +729,7 @@ class Trainer:
                 print(row)
 
 # ---- Plotting functions ----
-def plot_losses(fit_losses, cont_losses, ic_losses, colloc_losses, end_losses):
+def plot_losses(fit_losses, cont_losses, ic_losses, colloc_losses, end_losses, showplot=True):
     epochs = list(range(len(fit_losses)))
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
     ax1.stackplot(
@@ -748,9 +763,10 @@ def plot_losses(fit_losses, cont_losses, ic_losses, colloc_losses, end_losses):
     ax2.legend(loc='upper right')
     plt.tight_layout()
     plt.savefig("training_losses.png")
-    plt.show()
+    if showplot:
+        plt.show()
 
-def plot_endpoint_convergence(x1_end_preds, x2_end_preds, t_test, args):
+def plot_endpoint_convergence(x1_end_preds, x2_end_preds, t_test, args, showplot=True):
     # Compute true solution over the full t_test grid and pick the final point
     t_test_tensor = t_test.to(args.device)
     x1_ts, y1_ts, x2_ts, y2_ts = solution(t_test_tensor, args)
@@ -774,9 +790,10 @@ def plot_endpoint_convergence(x1_end_preds, x2_end_preds, t_test, args):
     ax4.legend()
     plt.tight_layout()
     plt.savefig("endpoint_convergence.png")
-    plt.show()
+    if showplot:
+        plt.show()
 
-def plot_trajectories(odefunc, s, t_test, t_grid, args):
+def plot_trajectories(odefunc, s, t_test, t_grid, args, showplot=True):
     """ compare predicted and true trajectories
 
     Args:
@@ -861,12 +878,14 @@ def plot_trajectories(odefunc, s, t_test, t_grid, args):
     ax2.set_xlabel('Time'); ax2.set_ylabel('x2'); ax2.set_title('x2: True vs Pred'); ax2.legend()
     plt.tight_layout()
     plt.savefig("trajectories_comparison.png")
-    plt.show()
+    if showplot:
+        plt.show()
 
 def plot_spectral_losses(spec_mag_losses, 
                          spec_phase_losses, 
                          spec_mag_losses2, 
-                         spec_phase_losses2):
+                         spec_phase_losses2,
+                         showplot=True):
     # Optionally plot spectral losses
     plt.figure()
     plt.plot(spec_mag_losses, label="Spectral Magnitude Loss (x1)")
@@ -877,17 +896,25 @@ def plot_spectral_losses(spec_mag_losses,
     plt.legend()
     plt.title("Spectral Losses")
     plt.savefig("spectral_losses.png")
-    plt.show()
+    if showplot:
+        plt.show()
 
 
 # ---- New plotting functions for incremental study ----
-def plot_error_vs_time(results, original_tN):
+def plot_error_vs_time(results, original_tN, showplot=True):
     removed = [original_tN - rec['tN_truncated'] for rec in results]
     errors1 = [rec['x1_error'] for rec in results]
     errors2 = [rec['x2_error'] for rec in results]
     uncs1 = [rec['x1_unc'] for rec in results]
     uncs2 = [rec['x2_unc'] for rec in results]
-
+    data = dict(
+        {'Δt': removed,
+         'e1': errors1,
+         'e2': errors2,
+         'δ1': uncs1,
+         'δ2': uncs2}
+    )
+    
     fig, ax = plt.subplots()
     ax.errorbar(removed, errors1, yerr=uncs1, label='x1 Error', fmt='-o')
     ax.errorbar(removed, errors2, yerr=uncs2, label='x2 Error', fmt='-o')
@@ -896,9 +923,12 @@ def plot_error_vs_time(results, original_tN):
     ax.set_title('Endpoint Error vs. Time Removed')
     ax.legend()
     plt.savefig("endpoint_error_vs_time_removed.png")
-    plt.show()
+    if showplot:
+        plt.show()
+    print("Error data:")
+    pp.pprint(data)
 
-def plot_error_surface(results, original_tN):
+def plot_error_surface(results, original_tN, showplot=True):
     t_removed = np.array([original_tN - rec['tN_truncated'] for rec in results])
     end_losses = np.array([rec['end_losses'] for rec in results])
     epochs = np.arange(end_losses.shape[1])
@@ -924,7 +954,8 @@ def plot_error_surface(results, original_tN):
 
     plt.tight_layout()
     plt.savefig("endpoint_error_surface_heatmap.png")
-    plt.show()
+    if showplot:
+        plt.show()
 
 # ---- Main function ----
 def main():
@@ -938,15 +969,15 @@ def main():
     fit_losses, cont_losses, ic_losses, colloc_losses, end_losses, x1_end_preds, x2_end_preds, spec_mag_losses, spec_phase_losses, spec_mag_losses2, spec_phase_losses2 = trainer.train()
     # Print summarized losses at specified intervals
     trainer.print_loss_table()
-    plot_losses(fit_losses, cont_losses, ic_losses, colloc_losses, end_losses)
-    plot_endpoint_convergence(x1_end_preds, x2_end_preds, t_test=trainer.t_test, args=args)
-    plot_trajectories(trainer.odefunc, trainer.s, trainer.t_test, trainer.t_grid, args)
-    plot_spectral_losses(spec_mag_losses, spec_phase_losses, spec_mag_losses2, spec_phase_losses2)
+    plot_losses(fit_losses, cont_losses, ic_losses, colloc_losses, end_losses, showplot=args.showplot)
+    plot_endpoint_convergence(x1_end_preds, x2_end_preds, t_test=trainer.t_test, args=args, showplot=args.showplot)
+    plot_trajectories(trainer.odefunc, trainer.s, trainer.t_test, trainer.t_grid, args, showplot=args.showplot)
+    plot_spectral_losses(spec_mag_losses, spec_phase_losses, spec_mag_losses2, spec_phase_losses2, showplot=args.showplot)
 
     # Incremental truncation study
     results = trainer.train_incremental(args.delta_t, args.mc_runs)
-    plot_error_vs_time(results, args.tN)
-    plot_error_surface(results, args.tN)
+    plot_error_vs_time(results, args.tN, showplot=args.showplot)
+    plot_error_surface(results, args.tN, showplot=args.showplot)
 
 
 if __name__ == "__main__":
