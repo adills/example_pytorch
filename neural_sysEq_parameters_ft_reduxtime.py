@@ -39,6 +39,7 @@ This script demonstrates a **physics-informed Neural ODE** that integrates known
 
 # %%
 import torch
+import warnings
 from os import cpu_count
 from torchdiffeq import odeint
 import matplotlib.pyplot as plt
@@ -51,8 +52,8 @@ from mpl_toolkits.mplot3d import Axes3D
 n_logical = cpu_count()
 torch.set_num_threads(n_logical)
 torch.set_num_interop_threads(n_logical)
-import pprint
-pp = pprint.PrettyPrinter(indent=4)
+# import pprint
+# pp = pprint.PrettyPrinter(indent=4)
 
 # ---- SIREN/Sine activation ----
 class Sine(torch.nn.Module):
@@ -442,7 +443,10 @@ class Trainer:
             # Train fresh model
             tr = Trainer(args_loc, data_loc)
             tr.train()
-            # MC-dropout uncertainty
+            # Ensure dropout is active for MC sampling
+            if tr.args.dropout_rate == 0:
+                warnings.warn("dropout_rate=0; MC-dropout uncertainty will be zero. Set --dropout_rate > 0 to enable variability.")
+            tr.model.train()
             tr.model.enable_dropout()
             mc_preds1 = []
             mc_preds2 = []
@@ -926,7 +930,13 @@ def plot_error_vs_time(results, original_tN, showplot=True):
     if showplot:
         plt.show()
     print("Error data:")
-    pp.pprint(data)
+    # pp.pprint(data)
+    # Print the names of the columns.
+    print("{:<10} {:<10} {:<10} {:<10} {:<10}".format('Δt', 'e1', 'δ1', 'e2', 'δ2'))
+    # print each data item.
+    for key, value in data.items():
+        dt, e1, e2, u1, u2 = value
+        print("{:<10} {:<10} {:<10} {:<10} {:<10}".format(dt, e1, u1, e2, u2))
 
 def plot_error_surface(results, original_tN, showplot=True):
     t_removed = np.array([original_tN - rec['tN_truncated'] for rec in results])
