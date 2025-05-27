@@ -930,13 +930,11 @@ def plot_error_vs_time(results, original_tN, showplot=True):
     if showplot:
         plt.show()
     print("Error data:")
-    # pp.pprint(data)
     # Print the names of the columns.
     print("{:<10} {:<10} {:<10} {:<10} {:<10}".format('Δt', 'e1', 'δ1', 'e2', 'δ2'))
-    # print each data item.
-    for key, value in data.items():
-        dt, e1, e2, u1, u2 = value
-        print("{:<10} {:<10} {:<10} {:<10} {:<10}".format(dt, e1, u1, e2, u2))
+    # print each data row.
+    for dt, e1, e2, u1, u2 in zip(data['Δt'], data['e1'], data['e2'], data['δ1'], data['δ2']):
+        print("{:<10.3f} {:<10.3f} {:<10.3f} {:<10.3f} {:<10.3f}".format(dt, e1, u1, e2, u2))
 
 def plot_error_surface(results, original_tN, showplot=True):
     t_removed = np.array([original_tN - rec['tN_truncated'] for rec in results])
