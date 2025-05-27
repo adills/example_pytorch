@@ -69,7 +69,7 @@ def parse_args():
     parser.add_argument("--hidden_size", type=int, nargs="+", default=[256,128,256,128,256,128])
     parser.add_argument("--activation_fn", type=str, choices=["SiLU", "Tanh", "SIREN"], default="SIREN",
                         help="Activation function: SiLU, Tanh, or SIREN")
-    parser.add_argument("--dropout_rate", type=float, default=0.0)
+    parser.add_argument("--dropout_rate", type=float, default=0.4)
     parser.add_argument("--integrator", type=str, choices=["rk4", "dopri5"], default="dopri5")
     parser.add_argument("--test_integrator", type=str, choices=["rk4", "dopri5"], default="rk4")
     parser.add_argument("--rtol", type=float, default=1e-3, help="Relative tolerance for dopri5")
@@ -89,7 +89,7 @@ def parse_args():
     parser.add_argument("--tN", type=float, default=10.0, help="End time")
     parser.add_argument("--delta_t", type=float, default=1.0,
                         help="Time decrement for each iteration when truncating the time domain")
-    parser.add_argument("--mc_runs", type=int, default=20,
+    parser.add_argument("--mc_runs", type=int, default=50,
                         help="Number of MC-dropout runs to estimate endpoint uncertainty")
     parser.add_argument(
         "--no-showplot",
@@ -198,14 +198,20 @@ def create_sequential_model(input_size: int = 1, hidden_layers: list = [64, 64],
                             dropout_rate: float = 0.2):
     layers = []
     prev_size = input_size
-    layers.append(torch.nn.Linear(prev_size, hidden_layers[0]))
+    # First hidden layer without dropout
+    first_size = hidden_layers[0]
+    layers.append(torch.nn.Linear(prev_size, first_size))
     layers.append(activation())
-    prev_size = hidden_layers[0]
-    for size in (hidden_layers[1:]):
+    prev_size = first_size
+    # Remaining hidden layers with variable dropout
+    for i, size in enumerate(hidden_layers[1:], start=1):
         layers.append(torch.nn.Linear(prev_size, size))
         layers.append(activation())
+        # Increase dropout rate by 0.1 per layer, capped at 0.5
+        rate = min(dropout_rate + 0.1 * (i-1), 0.5)
+        layers.append(torch.nn.Dropout(rate))
         prev_size = size
-    layers.append(torch.nn.Dropout(dropout_rate))
+    # Final output layer without dropout
     layers.append(torch.nn.Linear(prev_size, output_size))
     return torch.nn.Sequential(*layers)
 
