@@ -971,6 +971,59 @@ def plot_error_surface(results, original_tN, showplot=True):
     if showplot:
         plt.show()
 
+
+# ---- Calibration monitoring function ----
+def monitor_calibration(results, original_tN, showplot=True):
+    """
+    Evaluate calibration: percentage of endpoint errors within ±1σ.
+    Plots error vs. time removed with error bars and overlays coverage stats
+    and tuning recommendations.
+    """
+    # Extract arrays
+    removed = np.array([original_tN - rec['tN_truncated'] for rec in results])
+    errors1 = np.array([rec['x1_error'] for rec in results])
+    errors2 = np.array([rec['x2_error'] for rec in results])
+    uncs1 = np.array([rec['x1_unc'] for rec in results])
+    uncs2 = np.array([rec['x2_unc'] for rec in results])
+
+    # Coverage booleans
+    in1 = errors1 <= uncs1
+    in2 = errors2 <= uncs2
+    cov1 = in1.mean()
+    cov2 = in2.mean()
+
+    # Recommendations
+    recs = []
+    if cov1 < 0.68 or cov2 < 0.68:
+        recs.append("Increase dropout_rate or mc_runs to widen uncertainty bands.")
+    if cov1 > 0.90 and cov2 > 0.90:
+        recs.append("Consider reducing dropout_rate to tighten uncertainty bands.")
+    rec_text = "\n".join(recs) if recs else "Uncertainty well calibrated."
+
+    # Plot
+    fig, ax = plt.subplots()
+    ax.errorbar(removed, errors1, yerr=uncs1, label='x1 Error', fmt='-o')
+    ax.errorbar(removed, errors2, yerr=uncs2, label='x2 Error', fmt='-o')
+    ax.set_xlabel('Time Removed')
+    ax.set_ylabel('Absolute Error')
+    ax.set_title('Calibration: Endpoint Error vs. ±1σ Bands')
+    ax.legend()
+
+    # Text overlay
+    textstr = (
+        f"x1 coverage: {cov1*100:.1f}%\n"
+        f"x2 coverage: {cov2*100:.1f}%\n"
+        f"{rec_text}"
+    )
+    props = dict(boxstyle='round', facecolor='white', alpha=0.7)
+    ax.text(0.05, 0.95, textstr, transform=ax.transAxes,
+            fontsize=10, verticalalignment='top', bbox=props)
+
+    plt.tight_layout()
+    plt.savefig("calibration_monitor.png")
+    if showplot:
+        plt.show()
+
 # ---- Main function ----
 def main():
     args = parse_args()
@@ -992,6 +1045,7 @@ def main():
     results = trainer.train_incremental(args.delta_t, args.mc_runs)
     plot_error_vs_time(results, args.tN, showplot=args.showplot)
     plot_error_surface(results, args.tN, showplot=args.showplot)
+    monitor_calibration(results, args.tN, showplot=args.showplot)
 
 
 if __name__ == "__main__":
