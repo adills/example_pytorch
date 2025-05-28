@@ -924,14 +924,28 @@ def plot_error_vs_time(results, original_tN, showplot=True):
          'δ1': uncs1,
          'δ2': uncs2}
     )
-    
-    fig, ax = plt.subplots()
-    ax.errorbar(removed, errors1, yerr=uncs1, label='x1 Error', fmt='-o')
-    ax.errorbar(removed, errors2, yerr=uncs2, label='x2 Error', fmt='-o')
-    ax.set_xlabel('Time Removed')
-    ax.set_ylabel('Absolute Error')
-    ax.set_title('Endpoint Error vs. Time Removed')
-    ax.legend()
+
+    fig, (ax_top, ax1, ax2) = plt.subplots(3, 1, figsize=(8, 12))
+    # Top combined errorbar plot
+    ax_top.errorbar(removed, errors1, yerr=uncs1, label='x1 Error', fmt='-o')
+    ax_top.errorbar(removed, errors2, yerr=uncs2, label='x2 Error', fmt='-o')
+    ax_top.set_xlabel('Time Removed')
+    ax_top.set_ylabel('Absolute Error')
+    ax_top.set_title('Endpoint Errors vs. Time Removed')
+    ax_top.legend()
+    # x1 individual subplot
+    ax1.errorbar(removed, errors1, yerr=uncs1, label='x1 Error', fmt='-o')
+    ax1.set_xlabel('Time Removed')
+    ax1.set_ylabel('Absolute Error')
+    ax1.set_title('x1 Endpoint Error')
+    ax1.legend()
+    # x2 individual subplot
+    ax2.errorbar(removed, errors2, yerr=uncs2, label='x2 Error', fmt='-o')
+    ax2.set_xlabel('Time Removed')
+    ax2.set_ylabel('Absolute Error')
+    ax2.set_title('x2 Endpoint Error')
+    ax2.legend()
+    plt.tight_layout()
     plt.savefig("endpoint_error_vs_time_removed.png")
     if showplot:
         plt.show()
