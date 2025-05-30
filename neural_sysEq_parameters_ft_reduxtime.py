@@ -505,6 +505,86 @@ class Trainer:
         self.incremental_results = results
         return results
 
+    def test_incremental(self):
+        """
+        Evaluate the already-trained model on incremental truncations.
+        At each truncation, build an evaluation grid that goes from t0 to the truncated time,
+        then jumps to the original tN, and compute deterministic and MC-dropout predictions
+        at tN without retraining.
+        Stores results in self.test_incremental_results.
+        """
+        t0 = self.args.t0
+        original_tN = self.args.tN
+        delta_t = self.args.delta_t
+        mc_runs = self.args.mc_runs
+        results = []
+        current_tN = original_tN
+        # Progress bar
+        total_steps = int(np.floor((original_tN - t0) / delta_t)) + 1
+        pbar = tqdm(total=total_steps, desc='Testing Incremental', unit='step')
+        # Prepare model for MC sampling
+        self.model.train()
+        self.model.enable_dropout()
+        while current_tN >= t0 + delta_t:
+            # Build evaluation times: truncated grid + final tN
+            t_test_full = self.t_test.to(self.args.device)
+            truncated_times = t_test_full[t_test_full <= current_tN]
+            if truncated_times[-1].item() != original_tN:
+                eval_times = torch.cat([truncated_times, torch.tensor([original_tN], device=self.args.device)])
+            else:
+                eval_times = truncated_times
+            # Deterministic prediction (eval mode)
+            self.model.eval()
+            with torch.no_grad():
+                u_full = odeint(self.odefunc, self.s[0], eval_times,
+                                rtol=self.args.rtol, atol=self.args.atol,
+                                method=self.args.test_integrator)
+                if u_full.ndim == 3:
+                    u_full = u_full.squeeze(1)
+            x1_pred = u_full[-1, 0].item()
+            x2_pred = u_full[-1, 2].item()
+            # MC-dropout samples (train mode)
+            self.model.train()
+            self.model.enable_dropout()
+            mc_preds1 = []
+            mc_preds2 = []
+            for _ in range(mc_runs):
+                u_mc = odeint(self.odefunc, self.s[0], eval_times,
+                              rtol=self.args.rtol, atol=self.args.atol,
+                              method=self.args.test_integrator)
+                if u_mc.ndim == 3:
+                    u_mc = u_mc.squeeze(1)
+                mc_preds1.append(u_mc[-1, 0].item())
+                mc_preds2.append(u_mc[-1, 2].item())
+            # True endpoints
+            x1_true_full = self.true_test_states[-1, 0, 0].item()
+            x2_true_full = self.true_test_states[-1, 0, 2].item()
+            # Errors
+            err1 = abs(x1_pred - x1_true_full)
+            err2 = abs(x2_pred - x2_true_full)
+            # Uncertainties (std of error samples)
+            err_samples1 = [p - x1_true_full for p in mc_preds1]
+            err_samples2 = [p - x2_true_full for p in mc_preds2]
+            unc1 = float(np.std(err_samples1))
+            unc2 = float(np.std(err_samples2))
+            # Record
+            results.append({
+                'tN_truncated': current_tN,
+                'x1_error': err1,
+                'x2_error': err2,
+                'x1_unc': unc1,
+                'x2_unc': unc2,
+                'x1_pred': x1_pred,
+                'x2_pred': x2_pred,
+                'x1_mc_samples': mc_preds1,
+                'x2_mc_samples': mc_preds2
+            })
+            current_tN -= delta_t
+            pbar.update(1)
+        pbar.close()
+        self.test_incremental_results = results
+        return results
+
     def train(self):
         args = self.args
         # Early‐stop and freeze setup for phase parameters
@@ -1038,6 +1118,53 @@ def monitor_calibration(results, original_tN, showplot=True):
     if showplot:
         plt.show()
 
+def plot_endpoint_scatter_with_ellipses(results, true_test_states, original_tN, showplot=True):
+    """
+    results:        output of test_incremental (list of dicts)
+    true_test_states: tensor of shape [len(t_test), 1, state_dim]
+    original_tN:    the full end time
+    """
+    # Extract true endpoint once
+    x1_true = true_test_states[-1, 0, 0].item()
+    x2_true = true_test_states[-1, 0, 2].item()
+
+    fig, ax = plt.subplots(figsize=(6,6))
+    # True endpoint
+    ax.plot(x1_true, x2_true, marker='*', color='red', markersize=12, label='True $(x_1,x_2)$')
+
+    for rec in results:
+        dt_removed = original_tN - rec['tN_truncated']
+        x1_pred = rec['x1_pred']
+        x2_pred = rec['x2_pred']
+        samples = np.column_stack([rec['x1_mc_samples'], rec['x2_mc_samples']])
+        # Compute covariance & eigen-decomp
+        cov = np.cov(samples, rowvar=False)
+        vals, vecs = np.linalg.eigh(cov)
+        # 1σ ellipse radii
+        width, height = 2*np.sqrt(vals)
+        # Angle of ellipse (in degrees)
+        angle = np.degrees(np.arctan2(vecs[1,0], vecs[0,0]))
+
+        # Plot mean point
+        ax.scatter(x1_pred, x2_pred, label=f'Δt={dt_removed:.2f}')
+        # Draw error ellipse
+        ellipse = Ellipse(
+            xy=(x1_pred, x2_pred),
+            width=width, height=height,
+            angle=angle,
+            alpha=0.3
+        )
+        ax.add_patch(ellipse)
+
+    ax.set_xlabel('$x_1(t_N)$')
+    ax.set_ylabel('$x_2(t_N)$')
+    ax.set_title('Predicted vs True Endpoints with 1σ Ellipses')
+    ax.legend(bbox_to_anchor=(1.05,1), loc='upper left')
+    plt.tight_layout()
+    plt.savefig("endpoint_scatter_ellipses.png")
+    if showplot:
+        plt.show()
+
 # ---- Main function ----
 def main():
     args = parse_args()
@@ -1056,11 +1183,21 @@ def main():
     plot_spectral_losses(spec_mag_losses, spec_phase_losses, spec_mag_losses2, spec_phase_losses2, showplot=args.showplot)
 
     # Incremental truncation study
-    results = trainer.train_incremental(args.delta_t, args.mc_runs)
-    plot_error_vs_time(results, args.tN, showplot=args.showplot)
-    plot_error_surface(results, args.tN, showplot=args.showplot)
-    monitor_calibration(results, args.tN, showplot=args.showplot)
+    # results = trainer.train_incremental(args.delta_t, args.mc_runs)
+    # plot_error_vs_time(results, args.tN, showplot=args.showplot)
+    # plot_error_surface(results, args.tN, showplot=args.showplot)
+    # monitor_calibration(results, args.tN, showplot=args.showplot)
 
+    # Test Incremental truncation study
+    results_test = trainer.test_incremental(args)
+    plot_error_vs_time(results_test, args.tN, showplot=args.showplot)
+    monitor_calibration(results_test, args.tN, showplot=args.showplot)
+    plot_endpoint_scatter_with_ellipses(
+        results_test,
+        trainer.true_test_states,
+        args.tN,
+        showplot=args.showplot
+    )
 
 if __name__ == "__main__":
     main()
