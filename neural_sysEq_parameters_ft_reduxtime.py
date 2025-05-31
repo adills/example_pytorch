@@ -1189,7 +1189,7 @@ def main():
     # monitor_calibration(results, args.tN, showplot=args.showplot)
 
     # Test Incremental truncation study
-    results_test = trainer.test_incremental(args)
+    results_test = trainer.test_incremental()
     plot_error_vs_time(results_test, args.tN, showplot=args.showplot)
     monitor_calibration(results_test, args.tN, showplot=args.showplot)
     plot_endpoint_scatter_with_ellipses(
