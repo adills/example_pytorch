@@ -43,6 +43,7 @@ import warnings
 from os import cpu_count
 from torchdiffeq import odeint
 import matplotlib.pyplot as plt
+from matplotlib.patches import Ellipse
 # Add tqdm for progress bar
 from tqdm import tqdm
 import copy
