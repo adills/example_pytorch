@@ -308,7 +308,7 @@ class MODEL(torch.nn.Module):
             feats.append(self.A[i].unsqueeze(0) * torch.sin(fb))
         # concatenate features of shape [batch, num_modes]
         fourier_feats = torch.cat(feats, dim=1) if feats else torch.zeros((batch, 0), device=u.device)
-        inp = torch.cat([u, tb, fourier_feats], dim=1)
+        inp = torch.cat([u, tb], dim=1)#, fourier_feats], dim=1)
         return self.net(inp)
     def enable_dropout(self):
         for module in self.modules():
@@ -326,7 +326,7 @@ class ODEFunc(torch.nn.Module):
         dx1, dy1, dx2, dy2 = eom(u, self.p)
         phys = torch.stack([dx1, dy1, dx2, dy2], dim=-1)
         corr = self.model(t, u)
-        return phys + corr
+        return corr # + phys
 
 
 class Trainer:
@@ -356,7 +356,7 @@ class Trainer:
                 activation = torch.nn.Tanh
             else:
                 activation = Sine
-        input_size = self.state_dim + 1 + self.fourier_freqs.shape[0]
+        input_size = self.state_dim + 1 #+ self.fourier_freqs.shape[0]
         # Debug: print computed input size and Fourier frequencies count
         # print(f"[DEBUG] input_size = {input_size}, fourier_freqs count = {self.fourier_freqs.shape[0]}")
         self.model = MODEL(
@@ -376,8 +376,8 @@ class Trainer:
         other_params.append(self.s)
         self.optimizer = torch.optim.AdamW(
             [
-                {"params": phiA_params, "lr": 1e-2, "weight_decay": 0},
-                {"params": other_params, "lr": 1e-3, "weight_decay": 1e-4}
+                {"params": phiA_params, "lr": 1e-1, "weight_decay": 0},
+                {"params": other_params, "lr": 1e-2, "weight_decay": 1e-4}
             ]
         )
         # Two-stage LR: drop LR by 10x at halfway and 3/4 of training
