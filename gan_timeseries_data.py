@@ -56,6 +56,16 @@ TASKS:
    4.2 Invert normalization back to physical units.
    4.3 Evaluate distribution, trajectory, and temporal quality metrics.
    4.4 Optionally save comparison plots for qualitative inspection.
+5. Reconstruct complete synthetic trajectories from generated windows and compare
+   them against the original airborne training flights.
+   5.1 Keep window metadata so sampled windows retain their own elapsed-time axis.
+   5.2 Rebuild full synthetic flights on each retained flight's elapsed-time grid
+       by generating overlapping windows and averaging them back together.
+   5.3 Plot original altitude trajectories overlaid with synthetic altitude
+       trajectories on elapsed-time axes.
+   5.4 Plot the mean training altitude trajectory with its 1-sigma envelope
+       overlaid with the mean synthetic altitude trajectory and its 1-sigma
+       envelope on a shared normalized-time grid.
 
 Current Version (May 26, 2026):
 A. `gan_timeseries_data.py` is now filled in as a full PyTorch GAN scaffold at 
@@ -64,21 +74,53 @@ with the original 4 major TASK sections preserved and the Medium article's
 outline inserted as ordered sub-TASKs under each one.
 
 B. The implementation stays off NumPy in the data and training path. It loads 
-the OpenSky CSV with `csv`, builds torch tensors directly, creates sliding 
-flight windows, defines a PyTorch generator/discriminator pair for sequence 
-synthesis, trains them with an adversarial loop, and evaluates synthetic 
-sequences with trajectory RMSE, feature mean/std gaps, and lag-1 
+the OpenSky CSV with pandas, builds torch tensors for the learned state 
+features, creates sliding flight windows, defines a PyTorch 
+generator/discriminator pair for sequence synthesis, trains them with an 
+adversarial loop, and evaluates synthetic sequences with trajectory RMSE, 
+feature mean/std gaps, and lag-1 
 autocorrelation gaps. Each major TASK also has a validation checkpoint so 
 preprocessing, model shapes, and training history are checked before proceeding.
 
 C. I switched verification to `pipenv run` as requested. 
-`pipenv run python -m py_compile gan_timeseries_data.py` passed, and a 
-1-epoch smoke test also ran successfully on the local CSV with 3 flights and 
-77 windows.
+`pipenv run python -m py_compile gan_timeseries_data.py` passed, and repeated 
+1-epoch smoke tests also ran successfully on the local CSV.
 
-D. The current script treats time as implicit sequence order rather than a 
-generated feature, and uses `onground` only as a filtering label so the GAN 
-learns airborne state trajectories.
+D. The current script treats time as a fixed normalized conditioning channel
+rather than a generated feature, uses `onground` only as a filtering label so
+the GAN learns airborne state trajectories, and reconstructs complete synthetic
+flights by overlap-averaging generated windows back onto retained flight time
+grids.
+
+NOTE: Regarding Step 1.4, A flight can be long and every flight has a different 
+number of points. The GAN needs many training examples with one consistent 
+shape, so we cut each flight into fixed-length subsequences. In this script, 
+each window has length sequence_length=32 by default. Windows are extracted 
+with overlap using stride=8. After the latest changes, each window is shape (32, 5): 
+lat, lon, altitude_m, track_sin, track_cos.  
+*How the windows are used*:
+- create_training_windows(...) turns full flights into many normalized windows 
+for training by cutting each flight into overlapping (sequence_length, 
+feature_dim) windows.
+- Those windows are stacked into one tensor and fed to the DataLoader for the 
+actual GAN training examples.
+- During training, the discriminator sees real windows from that tensor and 
+fake windows from the generator.
+- The generator does not generate a whole flight. It generates one fixed-length 
+window at a time, conditioned on normalized time.
+*Why this is useful*:
+- It increases the number of training samples from a small number of flights.
+- It makes training feasible because every sample has the same dimensions.
+- It lets the model learn local trajectory behavior such as climb/cruise/turn patterns without needing to model an entire multi-hour flight at once.
+*Step 5 solution*:
+- The script now carries per-window metadata so sampled windows keep their exact
+elapsed-time axes for evaluation plots.
+- After training, a trajectory assembly step generates overlapping synthetic
+windows for each retained flight length and averages those windows back into one
+complete synthetic trajectory on the original elapsed-time grid.
+- Two additional plots summarize the result:
+  original vs synthetic altitude trajectories, and mean altitude with 1-sigma
+  envelopes on a shared normalized-time grid.
 """
 
 from __future__ import annotations
@@ -91,6 +133,7 @@ from pathlib import Path
 import pandas as pd
 import torch
 from torch import Tensor, nn
+from torch.nn import functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
 
@@ -134,6 +177,23 @@ class TrainConfig:
 class NormalizationStats:
     mean: Tensor
     std: Tensor
+
+
+@dataclass
+class WindowMetadata:
+    flight_label: str
+    flight_index: int
+    start_index: int
+    end_index: int
+    elapsed_seconds: Tensor
+
+
+@dataclass
+class FullTrajectory:
+    label: str
+    elapsed_seconds: Tensor
+    normalized_time: Tensor
+    features: Tensor
 
 
 @dataclass
@@ -244,6 +304,18 @@ def parse_args() -> argparse.Namespace:
         help="Optional output path for the qualitative comparison plot.",
     )
     parser.add_argument(
+        "--trajectory-overlay-plot-path",
+        type=Path,
+        default=Path("gan_timeseries_trajectory_overlay.png"),
+        help="Output path for the original-vs-synthetic full trajectory overlay.",
+    )
+    parser.add_argument(
+        "--trajectory-envelope-plot-path",
+        type=Path,
+        default=Path("gan_timeseries_trajectory_envelope.png"),
+        help="Output path for the mean trajectory plus 1-sigma envelope plot.",
+    )
+    parser.add_argument(
         "--raw-data-plot-path",
         type=Path,
         default=Path("gan_timeseries_loaded_altitude.png"),
@@ -311,6 +383,21 @@ def inverse_normalize(batch: Tensor, stats: NormalizationStats) -> Tensor:
     mean = stats.mean.to(device=batch.device, dtype=batch.dtype)
     std = stats.std.to(device=batch.device, dtype=batch.dtype)
     return batch * std + mean
+
+
+def compute_window_start_indices(
+    num_points: int,
+    sequence_length: int,
+    stride: int,
+) -> list[int]:
+    if num_points < sequence_length:
+        return []
+
+    start_indices = list(range(0, num_points - sequence_length + 1, stride))
+    final_start = num_points - sequence_length
+    if start_indices[-1] != final_start:
+        start_indices.append(final_start)
+    return start_indices
 
 
 def lag_one_autocorrelation(batch: Tensor) -> Tensor:
@@ -417,7 +504,7 @@ def create_training_windows(
     stride: int,
     min_flight_points: int,
     dtype: torch.dtype,
-) -> tuple[Tensor, NormalizationStats]:
+) -> tuple[Tensor, NormalizationStats, list[WindowMetadata]]:
     flight_tensors = build_flight_tensors(
         grouped_rows=flight_frames,
         min_flight_points=min_flight_points,
@@ -432,11 +519,38 @@ def create_training_windows(
     stats = NormalizationStats(mean=mean, std=std)
 
     windows: list[Tensor] = []
-    for flight_tensor in flight_tensors:
+    window_metadata: list[WindowMetadata] = []
+    valid_flight_frames = filter_valid_flight_frames(
+        grouped_rows=flight_frames,
+        min_flight_points=min_flight_points,
+        dtype=dtype,
+    )
+
+    for flight_index, (flight_tensor, flight_frame) in enumerate(
+        zip(flight_tensors, valid_flight_frames, strict=True)
+    ):
         normalized_flight = (flight_tensor - mean) / std
-        max_start = normalized_flight.size(0) - sequence_length + 1
-        for start_index in range(0, max_start, stride):
+        feature_frame = build_feature_frame(flight_frame)
+        elapsed_seconds = torch.tensor(
+            feature_frame["elapsed_seconds"].tolist(),
+            dtype=dtype,
+        )
+        start_indices = compute_window_start_indices(
+            num_points=normalized_flight.size(0),
+            sequence_length=sequence_length,
+            stride=stride,
+        )
+        for start_index in start_indices:
             windows.append(normalized_flight[start_index : start_index + sequence_length])
+            window_metadata.append(
+                WindowMetadata(
+                    flight_label=format_flight_label(flight_frame),
+                    flight_index=flight_index,
+                    start_index=start_index,
+                    end_index=start_index + sequence_length,
+                    elapsed_seconds=elapsed_seconds[start_index : start_index + sequence_length].clone(),
+                )
+            )
 
     if not windows:
         raise ValueError(
@@ -444,7 +558,7 @@ def create_training_windows(
             "--min-flight-points to fit the available trajectory lengths."
         )
 
-    return torch.stack(windows), stats
+    return torch.stack(windows), stats, window_metadata
 
 
 # 1.5 Validate preprocessing outputs before model construction.
@@ -523,6 +637,268 @@ def save_scaled_altitude_plot(
     axis.set_xlabel("Hours Since Takeoff")
     axis.set_ylabel("Scaled Altitude (z-score)")
     axis.set_title("Scaled Airborne Flight Data: Altitude vs Time Since Takeoff")
+    axis.grid(True, alpha=0.3)
+    axis.legend()
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+
+
+def build_real_trajectories(
+    flight_frames: list[pd.DataFrame],
+    dtype: torch.dtype,
+) -> list[FullTrajectory]:
+    trajectories: list[FullTrajectory] = []
+
+    for flight_frame in flight_frames:
+        feature_frame = build_feature_frame(flight_frame)
+        elapsed_seconds = torch.tensor(
+            feature_frame["elapsed_seconds"].tolist(),
+            dtype=dtype,
+        )
+        normalized_time = torch.linspace(
+            0.0,
+            1.0,
+            steps=len(feature_frame),
+            dtype=dtype,
+        )
+        feature_tensor = torch.tensor(
+            feature_frame[list(FEATURE_NAMES)].to_records(index=False).tolist(),
+            dtype=dtype,
+        )
+        trajectories.append(
+            FullTrajectory(
+                label=format_flight_label(flight_frame),
+                elapsed_seconds=elapsed_seconds,
+                normalized_time=normalized_time,
+                features=feature_tensor,
+            )
+        )
+
+    return trajectories
+
+
+class SyntheticTrajectoryAssembler:
+    def __init__(
+        self,
+        generator: nn.Module,
+        normalization_stats: NormalizationStats,
+        sequence_length: int,
+        stride: int,
+        latent_dim: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> None:
+        self.generator = generator
+        self.normalization_stats = normalization_stats
+        self.sequence_length = sequence_length
+        self.stride = stride
+        self.latent_dim = latent_dim
+        self.device = device
+        self.dtype = dtype
+
+    def _build_overlap_weights(self) -> Tensor:
+        if self.sequence_length == 1:
+            return torch.ones(1, 1, device=self.device, dtype=self.dtype)
+
+        positions = torch.arange(
+            self.sequence_length,
+            device=self.device,
+            dtype=self.dtype,
+        )
+        center = (self.sequence_length - 1) / 2.0
+        distances = torch.abs((positions - center) / max(center, 1.0))
+        weights = (1.0 - 0.5 * distances).clamp_min(0.5)
+        return weights.view(-1, 1)
+
+    def synthesize_trajectory(self, reference: FullTrajectory) -> FullTrajectory:
+        reference_length = reference.features.size(0)
+        start_indices = compute_window_start_indices(
+            num_points=reference_length,
+            sequence_length=self.sequence_length,
+            stride=self.stride,
+        )
+
+        accumulated = torch.zeros(
+            reference_length,
+            reference.features.size(1),
+            device=self.device,
+            dtype=self.dtype,
+        )
+        accumulated_weights = torch.zeros(
+            reference_length,
+            1,
+            device=self.device,
+            dtype=self.dtype,
+        )
+        window_weights = self._build_overlap_weights()
+
+        self.generator.eval()
+        with torch.no_grad():
+            for start_index in start_indices:
+                noise = torch.randn(
+                    1,
+                    self.latent_dim,
+                    device=self.device,
+                    dtype=self.dtype,
+                )
+                time_channel = build_normalized_time_channel(
+                    batch_size=1,
+                    sequence_length=self.sequence_length,
+                    device=self.device,
+                    dtype=self.dtype,
+                )
+                generated_window = self.generator(noise, time_channel)
+                generated_window = inverse_normalize(
+                    generated_window,
+                    self.normalization_stats,
+                )[0]
+                accumulated[start_index : start_index + self.sequence_length] += (
+                    generated_window * window_weights
+                )
+                accumulated_weights[
+                    start_index : start_index + self.sequence_length
+                ] += window_weights
+
+        full_features = accumulated / accumulated_weights.clamp_min(1e-6)
+        return FullTrajectory(
+            label=f"Synthetic {reference.label}",
+            elapsed_seconds=reference.elapsed_seconds.detach().cpu().clone(),
+            normalized_time=reference.normalized_time.detach().cpu().clone(),
+            features=full_features.detach().cpu(),
+        )
+
+    def synthesize_all(
+        self,
+        references: list[FullTrajectory],
+    ) -> list[FullTrajectory]:
+        return [self.synthesize_trajectory(reference) for reference in references]
+
+
+def save_trajectory_overlay_plot(
+    real_trajectories: list[FullTrajectory],
+    synthetic_trajectories: list[FullTrajectory],
+    output_path: Path,
+) -> None:
+    import matplotlib.pyplot as plt
+
+    altitude_index = FEATURE_NAMES.index("altitude_m")
+    fig, axis = plt.subplots(figsize=(10, 6))
+
+    for real_trajectory, synthetic_trajectory in zip(
+        real_trajectories,
+        synthetic_trajectories,
+        strict=True,
+    ):
+        elapsed_hours = (real_trajectory.elapsed_seconds / 3600.0).tolist()
+        real_altitude = real_trajectory.features[:, altitude_index].tolist()
+        synthetic_altitude = synthetic_trajectory.features[:, altitude_index].tolist()
+
+        real_line = axis.plot(
+            elapsed_hours,
+            real_altitude,
+            linewidth=1.8,
+            label=f"Real {real_trajectory.label}",
+        )[0]
+        axis.plot(
+            elapsed_hours,
+            synthetic_altitude,
+            linestyle="--",
+            linewidth=1.5,
+            color=real_line.get_color(),
+            label=f"Synthetic {real_trajectory.label}",
+        )
+
+    axis.set_xlabel("Hours Since Takeoff")
+    axis.set_ylabel("Altitude (m)")
+    axis.set_title("Original and Synthetic Full Trajectories")
+    axis.grid(True, alpha=0.3)
+    axis.legend(fontsize=8)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+
+
+def resample_trajectory_feature(
+    trajectories: list[FullTrajectory],
+    feature_name: str,
+    num_points: int,
+) -> tuple[Tensor, Tensor]:
+    feature_index = FEATURE_NAMES.index(feature_name)
+    resampled_series: list[Tensor] = []
+
+    for trajectory in trajectories:
+        feature_series = trajectory.features[:, feature_index].view(1, 1, -1)
+        resized_series = F.interpolate(
+            feature_series,
+            size=num_points,
+            mode="linear",
+            align_corners=True,
+        )
+        resampled_series.append(resized_series[0, 0])
+
+    stacked_series = torch.stack(resampled_series)
+    normalized_axis = torch.linspace(0.0, 1.0, steps=num_points, dtype=stacked_series.dtype)
+    return normalized_axis, stacked_series
+
+
+def save_trajectory_envelope_plot(
+    real_trajectories: list[FullTrajectory],
+    synthetic_trajectories: list[FullTrajectory],
+    output_path: Path,
+    num_points: int = 128,
+) -> None:
+    import matplotlib.pyplot as plt
+
+    normalized_axis, real_altitudes = resample_trajectory_feature(
+        trajectories=real_trajectories,
+        feature_name="altitude_m",
+        num_points=num_points,
+    )
+    _, synthetic_altitudes = resample_trajectory_feature(
+        trajectories=synthetic_trajectories,
+        feature_name="altitude_m",
+        num_points=num_points,
+    )
+
+    real_mean = real_altitudes.mean(dim=0)
+    real_std = real_altitudes.std(dim=0, correction=0)
+    synthetic_mean = synthetic_altitudes.mean(dim=0)
+    synthetic_std = synthetic_altitudes.std(dim=0, correction=0)
+
+    fig, axis = plt.subplots(figsize=(10, 6))
+
+    axis.fill_between(
+        normalized_axis.tolist(),
+        (real_mean - real_std).tolist(),
+        (real_mean + real_std).tolist(),
+        alpha=0.2,
+        label="Real +/- 1 sigma",
+    )
+    axis.plot(
+        normalized_axis.tolist(),
+        real_mean.tolist(),
+        linewidth=2.0,
+        label="Real mean altitude",
+    )
+    axis.fill_between(
+        normalized_axis.tolist(),
+        (synthetic_mean - synthetic_std).tolist(),
+        (synthetic_mean + synthetic_std).tolist(),
+        alpha=0.2,
+        label="Synthetic +/- 1 sigma",
+    )
+    axis.plot(
+        normalized_axis.tolist(),
+        synthetic_mean.tolist(),
+        linewidth=2.0,
+        linestyle="--",
+        label="Synthetic mean altitude",
+    )
+
+    axis.set_xlabel("Normalized Time")
+    axis.set_ylabel("Altitude (m)")
+    axis.set_title("Mean Altitude Trajectory with 1-Sigma Envelopes")
     axis.grid(True, alpha=0.3)
     axis.legend()
     fig.tight_layout()
@@ -843,13 +1219,15 @@ def generate_synthetic_sequences(
 # 4.2 Invert normalization back to physical units.
 def sample_real_sequences(
     sequences: Tensor,
+    window_metadata: list[WindowMetadata],
     num_sequences: int,
     device: torch.device,
     dtype: torch.dtype,
-) -> Tensor:
+) -> tuple[Tensor, list[WindowMetadata]]:
     sample_count = min(num_sequences, sequences.size(0))
     indices = torch.randperm(sequences.size(0))[:sample_count]
-    return sequences[indices].to(device=device, dtype=dtype)
+    sampled_metadata = [window_metadata[index] for index in indices.tolist()]
+    return sequences[indices].to(device=device, dtype=dtype), sampled_metadata
 
 
 # 4.3 Evaluate distribution, trajectory, and temporal quality metrics.
@@ -908,6 +1286,7 @@ def print_evaluation(metrics: dict[str, Tensor]) -> None:
 def save_comparison_plot(
     real_batch: Tensor,
     synthetic_batch: Tensor,
+    real_window_metadata: list[WindowMetadata],
     output_path: Path,
 ) -> None:
     import matplotlib.pyplot as plt
@@ -916,40 +1295,64 @@ def save_comparison_plot(
     real_sample = real_batch[0].detach().cpu()
     synthetic_sample = synthetic_batch[0].detach().cpu()
     step_axis = torch.arange(real_sample.size(0), dtype=torch.int64).tolist()
+    normalized_time_axis = build_normalized_time_channel(
+        batch_size=1,
+        sequence_length=real_sample.size(0),
+        device=torch.device("cpu"),
+        dtype=real_sample.dtype,
+    )[0, :, 0].tolist()
 
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    elapsed_time_axis = real_window_metadata[0].elapsed_seconds.detach().cpu().tolist()
+
+    fig, axes = plt.subplots(3, 1, figsize=(10, 10))
 
     axes[0].plot(
-        step_axis,
+        elapsed_time_axis,
         real_sample[:, altitude_index].tolist(),
         label="Real",
     )
     axes[0].plot(
-        step_axis,
+        elapsed_time_axis,
         synthetic_sample[:, altitude_index].tolist(),
         label="Synthetic",
     )
-    axes[0].set_title("Altitude vs sequence step")
-    axes[0].set_xlabel("Sequence step")
+    axes[0].set_title("Altitude vs elapsed time")
+    axes[0].set_xlabel("Elapsed seconds")
     axes[0].set_ylabel("Altitude (m)")
     axes[0].legend()
     axes[0].grid(True, alpha=0.3)
+
+    axes[1].plot(
+        normalized_time_axis,
+        real_sample[:, altitude_index].tolist(),
+        label="Real",
+    )
+    axes[1].plot(
+        normalized_time_axis,
+        synthetic_sample[:, altitude_index].tolist(),
+        label="Synthetic",
+    )
+    axes[1].set_title("Altitude vs normalized time")
+    axes[1].set_xlabel("Normalized time")
+    axes[1].set_ylabel("Altitude (m)")
+    axes[1].legend()
+    axes[1].grid(True, alpha=0.3)
 
     real_mean_altitude = real_batch[:, :, altitude_index].mean(dim=0).detach().cpu()
     synthetic_mean_altitude = (
         synthetic_batch[:, :, altitude_index].mean(dim=0).detach().cpu()
     )
-    axes[1].plot(step_axis, real_mean_altitude.tolist(), label="Real mean altitude")
-    axes[1].plot(
+    axes[2].plot(step_axis, real_mean_altitude.tolist(), label="Real mean altitude")
+    axes[2].plot(
         step_axis,
         synthetic_mean_altitude.tolist(),
         label="Synthetic mean altitude",
     )
-    axes[1].set_title("Mean altitude profile")
-    axes[1].set_xlabel("Sequence step")
-    axes[1].set_ylabel("Altitude (m)")
-    axes[1].legend()
-    axes[1].grid(True, alpha=0.3)
+    axes[2].set_title("Mean altitude profile")
+    axes[2].set_xlabel("Sequence step")
+    axes[2].set_ylabel("Altitude (m)")
+    axes[2].legend()
+    axes[2].grid(True, alpha=0.3)
 
     fig.tight_layout()
     fig.savefig(output_path, dpi=150)
@@ -988,8 +1391,8 @@ def main() -> None:
         min_flight_points=data_config.min_flight_points,
         dtype=dtype,
     )
-    sequences, normalization_stats = create_training_windows(
-        flight_frames=grouped_rows,
+    sequences, normalization_stats, window_metadata = create_training_windows(
+        flight_frames=valid_flight_frames,
         sequence_length=data_config.sequence_length,
         stride=data_config.stride,
         min_flight_points=data_config.min_flight_points,
@@ -1055,8 +1458,9 @@ def main() -> None:
         device=device,
         dtype=dtype,
     )
-    real_batch_normalized = sample_real_sequences(
+    real_batch_normalized, sampled_real_metadata = sample_real_sequences(
         sequences=sequences,
+        window_metadata=window_metadata,
         num_sequences=args.num_generate,
         device=device,
         dtype=dtype,
@@ -1071,13 +1475,41 @@ def main() -> None:
     )
     print_evaluation(metrics)
 
+    real_trajectories = build_real_trajectories(
+        flight_frames=valid_flight_frames,
+        dtype=dtype,
+    )
+    trajectory_assembler = SyntheticTrajectoryAssembler(
+        generator=components.generator,
+        normalization_stats=normalization_stats,
+        sequence_length=data_config.sequence_length,
+        stride=data_config.stride,
+        latent_dim=model_config.latent_dim,
+        device=device,
+        dtype=dtype,
+    )
+    synthetic_trajectories = trajectory_assembler.synthesize_all(real_trajectories)
+
     if not args.disable_plot:
         save_comparison_plot(
             real_batch=real_batch,
             synthetic_batch=synthetic_batch,
+            real_window_metadata=sampled_real_metadata,
             output_path=args.plot_path,
         )
+        save_trajectory_overlay_plot(
+            real_trajectories=real_trajectories,
+            synthetic_trajectories=synthetic_trajectories,
+            output_path=args.trajectory_overlay_plot_path,
+        )
+        save_trajectory_envelope_plot(
+            real_trajectories=real_trajectories,
+            synthetic_trajectories=synthetic_trajectories,
+            output_path=args.trajectory_envelope_plot_path,
+        )
         print(f"Saved comparison plot to: {args.plot_path}")
+        print(f"Saved trajectory overlay plot to: {args.trajectory_overlay_plot_path}")
+        print(f"Saved trajectory envelope plot to: {args.trajectory_envelope_plot_path}")
 
 
 if __name__ == "__main__":
