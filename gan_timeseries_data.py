@@ -316,6 +316,12 @@ def parse_args() -> argparse.Namespace:
         help="Output path for the mean trajectory plus 1-sigma envelope plot.",
     )
     parser.add_argument(
+        "--loss-plot-path",
+        type=Path,
+        default=Path("gan_timeseries_training_losses.png"),
+        help="Output path for the GAN training loss plot.",
+    )
+    parser.add_argument(
         "--raw-data-plot-path",
         type=Path,
         default=Path("gan_timeseries_loaded_altitude.png"),
@@ -899,6 +905,44 @@ def save_trajectory_envelope_plot(
     axis.set_xlabel("Normalized Time")
     axis.set_ylabel("Altitude (m)")
     axis.set_title("Mean Altitude Trajectory with 1-Sigma Envelopes")
+    axis.grid(True, alpha=0.3)
+    axis.legend()
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+
+
+def save_training_loss_plot(
+    history: dict[str, list[float]],
+    output_path: Path,
+) -> None:
+    import matplotlib.pyplot as plt
+
+    generator_loss = history["generator_loss"]
+    discriminator_loss = history["discriminator_loss"]
+    overall_loss = [
+        generator_value + discriminator_value
+        for generator_value, discriminator_value in zip(
+            generator_loss,
+            discriminator_loss,
+            strict=True,
+        )
+    ]
+    epoch_axis = list(range(1, len(generator_loss) + 1))
+
+    fig, axis = plt.subplots(figsize=(10, 6))
+    axis.plot(epoch_axis, discriminator_loss, label="Discriminator loss", linewidth=2.0)
+    axis.plot(epoch_axis, generator_loss, label="Generator loss", linewidth=2.0)
+    axis.plot(
+        epoch_axis,
+        overall_loss,
+        label="Overall loss",
+        linewidth=2.0,
+        linestyle="--",
+    )
+    axis.set_xlabel("Epoch")
+    axis.set_ylabel("Loss")
+    axis.set_title("GAN Training Loss History")
     axis.grid(True, alpha=0.3)
     axis.legend()
     fig.tight_layout()
@@ -1507,9 +1551,14 @@ def main() -> None:
             synthetic_trajectories=synthetic_trajectories,
             output_path=args.trajectory_envelope_plot_path,
         )
+        save_training_loss_plot(
+            history=history,
+            output_path=args.loss_plot_path,
+        )
         print(f"Saved comparison plot to: {args.plot_path}")
         print(f"Saved trajectory overlay plot to: {args.trajectory_overlay_plot_path}")
         print(f"Saved trajectory envelope plot to: {args.trajectory_envelope_plot_path}")
+        print(f"Saved training loss plot to: {args.loss_plot_path}")
 
 
 if __name__ == "__main__":
