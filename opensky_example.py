@@ -30,6 +30,9 @@ api = REST()
 REST_INTERVAL_LIMIT = pd.Timedelta(days=2)
 REST_CHUNK_RETRY_ATTEMPTS = 3
 REST_CHUNK_RETRY_SLEEP_SECONDS = 2
+REST_TRACK_RETRY_ATTEMPTS = 3
+REST_TRACK_RETRY_SLEEP_SECONDS = 2
+REST_TRACK_MAX_RETRY_AFTER_SECONDS = 30
 
 
 def plot_altitude_vs_time_since_takeoff(trajectory_df: pd.DataFrame) -> None:
@@ -167,6 +170,77 @@ def fetch_departure_chunk(
 
     return chunk_df
 
+
+def fetch_track_chunk(
+    api: REST,
+    icao24: str,
+    ts: str | pd.Timestamp,
+) -> pd.DataFrame:
+    ts_int = int(pd.Timestamp(ts).timestamp())
+    url = f"https://opensky-network.org/api/tracks/?icao24={icao24}&time={ts_int}"
+
+    for attempt in range(1, REST_TRACK_RETRY_ATTEMPTS + 1):
+        response = api.client.get(url, headers=api.headers)
+        status_code = response.status_code
+
+        if status_code == 404:
+            return pd.DataFrame()
+
+        if status_code in (429, 503):
+            if attempt == REST_TRACK_RETRY_ATTEMPTS:
+                response.raise_for_status()
+
+            retry_after_header = response.headers.get(
+                "X-Rate-Limit-Retry-After-Seconds"
+            )
+            fallback_sleep = REST_TRACK_RETRY_SLEEP_SECONDS * attempt
+            sleep_seconds = fallback_sleep
+
+            if retry_after_header is not None:
+                try:
+                    retry_after_seconds = int(retry_after_header)
+                    if retry_after_seconds > 0:
+                        sleep_seconds = min(
+                            retry_after_seconds,
+                            REST_TRACK_MAX_RETRY_AFTER_SECONDS,
+                        )
+                except ValueError:
+                    sleep_seconds = fallback_sleep
+
+            print(
+                f"Track lookup for {icao24} returned HTTP {status_code}. "
+                f"Sleeping {sleep_seconds}s before retry "
+                f"{attempt + 1}/{REST_TRACK_RETRY_ATTEMPTS}."
+            )
+            time.sleep(sleep_seconds)
+            continue
+
+        response.raise_for_status()
+        json = response.json()
+        return (
+            pd.DataFrame.from_records(
+                json["path"],
+                columns=[
+                    "timestamp",
+                    "latitude",
+                    "longitude",
+                    "altitude",
+                    "track",
+                    "onground",
+                ],
+            )
+            .assign(
+                timestamp=lambda df: pd.to_datetime(
+                    df.timestamp, utc=True, unit="s"
+                ),
+                icao24=json["icao24"],
+                callsign=json["callsign"],
+            )
+            .convert_dtypes(dtype_backend="pyarrow")
+        )
+
+    return pd.DataFrame()
+
 # Define parameters
 origin_airport = "EGLL"  # London Heathrow
 start_time = "2026-01-24 00:00:00"
@@ -253,7 +327,8 @@ for _, flight in long_haul_flights.head(3).iterrows():
     )
 
     try:
-        track_df = api.tracks(
+        track_df = fetch_track_chunk(
+            api=api,
             icao24=flight["icao24"],
             ts=flight["firstSeen"],
         )
