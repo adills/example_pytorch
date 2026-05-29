@@ -75,6 +75,23 @@ database URL.
 
 Recommended macOS setup with Homebrew:
 
+Automated setup option:
+
+Run the helper script in this repository:
+
+    ./opensky_create_postgresql_db.sh
+
+That script will:
+
+- install ``postgresql@16`` with Homebrew if needed
+- start the local PostgreSQL service
+- add the PostgreSQL client ``bin`` directory to ``PATH`` for the script run,
+  but only if that directory exists
+- create the local ``opensky_scientific`` database if needed
+- print the default SQLAlchemy URL used by this module
+
+Manual setup option:
+
 1. Install PostgreSQL:
 
        brew install postgresql@16
