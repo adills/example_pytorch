@@ -129,7 +129,10 @@ Unit tests for the filtering and query-builder logic live in:
 
 Run them with:
 
-    /Users/anthonydills/.local/share/virtualenvs/example_pytorch-XJ8KPHaX/bin/python -m unittest discover -s tests -v
+    PYTHONPATH=. pipenv run pytest tests -v
+
+    or directly with unittest:
+    pipenv run python -m unittest discover -s tests -v
 
 Notes
 -----
