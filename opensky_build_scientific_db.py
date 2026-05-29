@@ -55,8 +55,8 @@ Query the local database with the default join:
         --minimum-duration-hours 6 \
         --sample-trajectories 25
 
-The ``build`` command will not re-download files that already exist in the
-specified download directory.
+The ``build`` command processes source files one at a time through a temporary
+workspace, instead of downloading the full scientific datasets up front.
 
 Requirements
 ------------
@@ -65,7 +65,7 @@ Requirements
   - httpx
   - sqlalchemy
 - A PostgreSQL driver compatible with SQLAlchemy, e.g. ``psycopg``
-- A writable local download directory, such as an external drive
+- A writable temporary workspace directory, such as an external drive
 
 Local PostgreSQL setup
 ----------------------
@@ -118,8 +118,9 @@ After that, the script's default database URL is usually sufficient:
 
 The PostgreSQL server decides where the database files live on disk. With the
 Homebrew setup above, the data directory is typically managed under
-``/opt/homebrew/var/postgresql@16``. The large scientific source downloads are
-separate and should be directed to an external drive with ``--download-dir``.
+``/opt/homebrew/var/postgresql@16``. The large scientific source files are
+processed one at a time through the workspace directory you provide with
+``--download-dir``.
 
 Testing
 -------
@@ -143,6 +144,9 @@ Notes
   normalized ``callsign``, and time-window overlap.
 - The builder uses remote metadata endpoints and public bucket listing where
   possible, falling back to HTML scraping only if needed.
+- To reduce intermediate storage, the build path downloads at most one source
+  file at a time into the temporary workspace, ingests the filtered rows, and
+  then deletes the temporary file.
 """
 
 from __future__ import annotations
@@ -152,13 +156,11 @@ import csv
 from dataclasses import dataclass
 from datetime import date, timedelta
 import getpass
-import gzip
 import io
-import json
 from pathlib import Path
 import re
 import tarfile
-import time
+import tempfile
 from typing import Any, Iterable, Iterator, Sequence
 from urllib.parse import urljoin
 import xml.etree.ElementTree as ET
@@ -208,6 +210,11 @@ class BuildConfig:
     state_archive_format: str = DEFAULT_STATE_ARCHIVE_FORMAT
     max_covid_files: int | None = None
     max_state_archives: int | None = None
+
+
+MANIFEST_STATUS_COMPLETED = "completed"
+MANIFEST_STATUS_FAILED = "failed"
+MANIFEST_STATUS_IN_PROGRESS = "in_progress"
 
 
 def normalize_callsign(value: Any) -> str | None:
@@ -298,6 +305,19 @@ def create_schema(engine: Engine) -> None:
         )
         """,
         """
+        CREATE TABLE IF NOT EXISTS scientific_ingest_manifest (
+            source_dataset TEXT NOT NULL,
+            source_file TEXT NOT NULL,
+            source_url TEXT,
+            status TEXT NOT NULL,
+            rows_inserted BIGINT NOT NULL DEFAULT 0,
+            started_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+            completed_at TIMESTAMP WITH TIME ZONE,
+            error_message TEXT,
+            PRIMARY KEY (source_dataset, source_file)
+        )
+        """,
+        """
         CREATE INDEX IF NOT EXISTS idx_scientific_flights_origin_firstseen
         ON scientific_flights (origin, firstseen)
         """,
@@ -312,6 +332,10 @@ def create_schema(engine: Engine) -> None:
         """
         CREATE INDEX IF NOT EXISTS idx_state_vectors_icao24_time
         ON scientific_state_vectors (icao24, time)
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_ingest_manifest_status
+        ON scientific_ingest_manifest (status, source_dataset)
         """,
     ]
 
@@ -428,36 +452,211 @@ def fetch_state_archive_metadata(
     return sorted(files, key=lambda item: item["name"])
 
 
-def download_file_if_missing(url: str, destination: Path) -> Path:
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    if destination.exists():
-        print(f"Using existing download: {destination}")
-        return destination
+def ensure_workspace(download_dir: Path) -> Path:
+    download_dir.mkdir(parents=True, exist_ok=True)
+    return download_dir
 
-    print(f"Downloading {url} -> {destination}")
-    with httpx.Client(timeout=DEFAULT_HTTP_TIMEOUT_SECONDS, follow_redirects=True) as client:
-        with client.stream("GET", url) as response:
-            response.raise_for_status()
-            with destination.open("wb") as handle:
+
+def download_to_temporary_file(url: str, workspace_dir: Path, filename: str) -> Path:
+    ensure_workspace(workspace_dir)
+    suffix = "".join(Path(filename).suffixes) or ".tmp"
+    with tempfile.NamedTemporaryFile(
+        mode="wb",
+        suffix=suffix,
+        prefix="opensky_",
+        dir=workspace_dir,
+        delete=False,
+    ) as handle:
+        temp_path = Path(handle.name)
+        print(f"Streaming {url} -> temporary file {temp_path}")
+        with httpx.Client(
+            timeout=DEFAULT_HTTP_TIMEOUT_SECONDS,
+            follow_redirects=True,
+        ) as client:
+            with client.stream("GET", url) as response:
+                response.raise_for_status()
                 for chunk in response.iter_bytes(chunk_size=DOWNLOAD_CHUNK_SIZE):
                     if chunk:
                         handle.write(chunk)
-    return destination
+    return temp_path
 
 
-def ensure_downloads(
-    file_metadata: Sequence[dict[str, str]],
-    download_dir: Path,
+def get_manifest_status(
+    engine: Engine,
+    source_dataset: str,
+    source_file: str,
+) -> str | None:
+    query = text(
+        """
+        SELECT status
+        FROM scientific_ingest_manifest
+        WHERE source_dataset = :source_dataset
+          AND source_file = :source_file
+        """
+    )
+    with engine.begin() as connection:
+        result = connection.execute(
+            query,
+            {
+                "source_dataset": source_dataset,
+                "source_file": source_file,
+            },
+        ).scalar_one_or_none()
+    return str(result) if result is not None else None
+
+
+def mark_manifest_started(
+    engine: Engine,
     *,
-    subdir: str,
-    limit: int | None = None,
-) -> list[Path]:
-    selected = list(file_metadata[:limit] if limit is not None else file_metadata)
-    downloaded_paths = []
-    for entry in progress(selected, desc=f"Download {subdir}", total=len(selected), unit="file"):
-        destination = download_dir / subdir / entry["name"]
-        downloaded_paths.append(download_file_if_missing(entry["url"], destination))
-    return downloaded_paths
+    source_dataset: str,
+    source_file: str,
+    source_url: str,
+) -> None:
+    statement = text(
+        """
+        INSERT INTO scientific_ingest_manifest (
+            source_dataset,
+            source_file,
+            source_url,
+            status,
+            rows_inserted,
+            started_at,
+            completed_at,
+            error_message
+        )
+        VALUES (
+            :source_dataset,
+            :source_file,
+            :source_url,
+            :status,
+            0,
+            NOW(),
+            NULL,
+            NULL
+        )
+        ON CONFLICT (source_dataset, source_file)
+        DO UPDATE SET
+            source_url = EXCLUDED.source_url,
+            status = EXCLUDED.status,
+            rows_inserted = 0,
+            started_at = NOW(),
+            completed_at = NULL,
+            error_message = NULL
+        """
+    )
+    with engine.begin() as connection:
+        connection.execute(
+            statement,
+            {
+                "source_dataset": source_dataset,
+                "source_file": source_file,
+                "source_url": source_url,
+                "status": MANIFEST_STATUS_IN_PROGRESS,
+            },
+        )
+
+
+def mark_manifest_completed(
+    engine: Engine,
+    *,
+    source_dataset: str,
+    source_file: str,
+    source_url: str,
+    rows_inserted: int,
+) -> None:
+    statement = text(
+        """
+        INSERT INTO scientific_ingest_manifest (
+            source_dataset,
+            source_file,
+            source_url,
+            status,
+            rows_inserted,
+            started_at,
+            completed_at,
+            error_message
+        )
+        VALUES (
+            :source_dataset,
+            :source_file,
+            :source_url,
+            :status,
+            :rows_inserted,
+            NOW(),
+            NOW(),
+            NULL
+        )
+        ON CONFLICT (source_dataset, source_file)
+        DO UPDATE SET
+            source_url = EXCLUDED.source_url,
+            status = EXCLUDED.status,
+            rows_inserted = EXCLUDED.rows_inserted,
+            completed_at = NOW(),
+            error_message = NULL
+        """
+    )
+    with engine.begin() as connection:
+        connection.execute(
+            statement,
+            {
+                "source_dataset": source_dataset,
+                "source_file": source_file,
+                "source_url": source_url,
+                "status": MANIFEST_STATUS_COMPLETED,
+                "rows_inserted": rows_inserted,
+            },
+        )
+
+
+def mark_manifest_failed(
+    engine: Engine,
+    *,
+    source_dataset: str,
+    source_file: str,
+    source_url: str,
+    error_message: str,
+) -> None:
+    statement = text(
+        """
+        INSERT INTO scientific_ingest_manifest (
+            source_dataset,
+            source_file,
+            source_url,
+            status,
+            rows_inserted,
+            started_at,
+            completed_at,
+            error_message
+        )
+        VALUES (
+            :source_dataset,
+            :source_file,
+            :source_url,
+            :status,
+            0,
+            NOW(),
+            NOW(),
+            :error_message
+        )
+        ON CONFLICT (source_dataset, source_file)
+        DO UPDATE SET
+            source_url = EXCLUDED.source_url,
+            status = EXCLUDED.status,
+            completed_at = NOW(),
+            error_message = EXCLUDED.error_message
+        """
+    )
+    with engine.begin() as connection:
+        connection.execute(
+            statement,
+            {
+                "source_dataset": source_dataset,
+                "source_file": source_file,
+                "source_url": source_url,
+                "status": MANIFEST_STATUS_FAILED,
+                "error_message": error_message,
+            },
+        )
 
 
 def parse_timestamp_column(series: pd.Series) -> pd.Series:
@@ -550,31 +749,93 @@ def insert_records(
     return len(records)
 
 
-def ingest_filtered_covid_flights(
+def process_covid_file_streaming(
     engine: Engine,
-    covid_paths: Sequence[Path],
     *,
+    file_metadata: dict[str, str],
+    workspace_dir: Path,
     origin_airports: Sequence[str],
     minimum_duration_hours: float,
-) -> None:
-    for covid_path in progress(covid_paths, desc="Ingest COVID flights", total=len(covid_paths), unit="file"):
-        print(f"Processing flight manifest: {covid_path}")
-        for chunk in pd.read_csv(covid_path, compression="gzip", chunksize=COVID_CHUNK_ROWS):
+) -> int:
+    source_file = file_metadata["name"]
+    source_url = file_metadata["url"]
+    manifest_status = get_manifest_status(engine, "covid_flight_dataset", source_file)
+    if manifest_status == MANIFEST_STATUS_COMPLETED:
+        print(f"Skipping already ingested flight manifest: {source_file}")
+        return 0
+
+    mark_manifest_started(
+        engine,
+        source_dataset="covid_flight_dataset",
+        source_file=source_file,
+        source_url=source_url,
+    )
+    temp_path: Path | None = None
+    inserted_rows = 0
+    try:
+        temp_path = download_to_temporary_file(source_url, workspace_dir, source_file)
+        print(f"Processing flight manifest: {source_file}")
+        for chunk in pd.read_csv(temp_path, compression="gzip", chunksize=COVID_CHUNK_ROWS):
             filtered = filter_covid_chunk(
                 chunk,
                 origin_airports=origin_airports,
                 minimum_duration_hours=minimum_duration_hours,
-                source_file=covid_path.name,
+                source_file=source_file,
             )
             if filtered.empty:
                 continue
             records = filtered.to_dict(orient="records")
-            insert_records(
+            inserted_rows += insert_records(
                 engine,
                 "scientific_flights",
                 records,
                 conflict_columns=["flight_key"],
             )
+        mark_manifest_completed(
+            engine,
+            source_dataset="covid_flight_dataset",
+            source_file=source_file,
+            source_url=source_url,
+            rows_inserted=inserted_rows,
+        )
+        return inserted_rows
+    except Exception as exc:
+        mark_manifest_failed(
+            engine,
+            source_dataset="covid_flight_dataset",
+            source_file=source_file,
+            source_url=source_url,
+            error_message=str(exc),
+        )
+        raise
+    finally:
+        if temp_path is not None and temp_path.exists():
+            temp_path.unlink()
+
+
+def ingest_filtered_covid_flights_streaming(
+    engine: Engine,
+    covid_files: Sequence[dict[str, str]],
+    *,
+    workspace_dir: Path,
+    origin_airports: Sequence[str],
+    minimum_duration_hours: float,
+) -> int:
+    total_inserted = 0
+    for file_metadata in progress(
+        covid_files,
+        desc="Ingest COVID flights",
+        total=len(covid_files),
+        unit="file",
+    ):
+        total_inserted += process_covid_file_streaming(
+            engine,
+            file_metadata=file_metadata,
+            workspace_dir=workspace_dir,
+            origin_airports=origin_airports,
+            minimum_duration_hours=minimum_duration_hours,
+        )
+    return total_inserted
 
 
 def load_candidate_days_from_db(
@@ -607,6 +868,35 @@ def load_candidate_days_from_db(
     return candidate_days
 
 
+def load_candidate_archive_hours_from_db(
+    engine: Engine,
+    origin_airports: Sequence[str],
+    minimum_duration_hours: float,
+) -> set[pd.Timestamp]:
+    flights_df = pd.read_sql_query(
+        text(
+            """
+            SELECT firstseen, lastseen, origin, duration_hours
+            FROM scientific_flights
+            """
+        ),
+        engine,
+    )
+    flights_df = flights_df[
+        flights_df["origin"].isin(origin_airports)
+        & flights_df["duration_hours"].ge(minimum_duration_hours)
+    ].copy()
+
+    candidate_hours: set[pd.Timestamp] = set()
+    for row in flights_df.itertuples(index=False):
+        current_hour = pd.Timestamp(row.firstseen).floor("h")
+        last_hour = pd.Timestamp(row.lastseen).floor("h")
+        while current_hour <= last_hour:
+            candidate_hours.add(current_hour)
+            current_hour += pd.Timedelta(hours=1)
+    return candidate_hours
+
+
 def load_flights_for_day(engine: Engine, day: date) -> list[dict[str, Any]]:
     day_start = pd.Timestamp(day, tz="UTC")
     day_end = day_start + pd.Timedelta(days=1)
@@ -629,6 +919,19 @@ def load_flights_for_day(engine: Engine, day: date) -> list[dict[str, Any]]:
     for flight in flights:
         flight["callsign_normalized"] = normalize_callsign(flight["callsign"])
     return flights
+
+
+def extract_archive_hour_from_name(name: str) -> pd.Timestamp | None:
+    match = re.search(
+        r"states_(?P<date>\d{4}-\d{2}-\d{2})[-_](?P<hour>\d{2})",
+        name,
+    )
+    if match is None:
+        return None
+    return pd.Timestamp(
+        f"{match.group('date')} {match.group('hour')}:00:00",
+        tz="UTC",
+    )
 
 
 def build_flight_lookup(flights: Sequence[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
@@ -752,32 +1055,52 @@ def iter_csv_members_from_tar(archive_path: Path) -> Iterator[tuple[str, csv.Dic
             yield member.name, reader
 
 
-def ingest_matching_state_vectors(
+def process_state_archive_streaming(
     engine: Engine,
-    state_archives: Sequence[Path],
+    *,
+    archive_metadata: dict[str, str],
+    workspace_dir: Path,
     candidate_days: set[date],
-) -> None:
-    for archive_path in progress(
-        state_archives,
-        desc="Ingest state vectors",
-        total=len(state_archives),
-        unit="archive",
-    ):
-        archive_day = extract_date_from_name(archive_path.name)
-        if archive_day is not None and candidate_days and archive_day not in candidate_days:
-            print(f"Skipping archive outside candidate day set: {archive_path.name}")
-            continue
+) -> int:
+    source_file = archive_metadata["name"]
+    source_url = archive_metadata["url"]
+    manifest_status = get_manifest_status(engine, "weekly_state_vectors", source_file)
+    if manifest_status == MANIFEST_STATUS_COMPLETED:
+        print(f"Skipping already ingested state archive: {source_file}")
+        return 0
 
-        print(f"Processing state archive: {archive_path}")
+    archive_day = extract_date_from_name(source_file)
+    if archive_day is not None and candidate_days and archive_day not in candidate_days:
+        print(f"Skipping archive outside candidate day set: {source_file}")
+        return 0
+
+    mark_manifest_started(
+        engine,
+        source_dataset="weekly_state_vectors",
+        source_file=source_file,
+        source_url=source_url,
+    )
+    temp_path: Path | None = None
+    total_inserted = 0
+    try:
+        temp_path = download_to_temporary_file(source_url, workspace_dir, source_file)
+        print(f"Processing state archive: {source_file}")
         flights = load_flights_for_day(engine, archive_day) if archive_day is not None else []
         if not flights:
             print(f"No eligible flights found for archive day: {archive_day}")
-            continue
+            mark_manifest_completed(
+                engine,
+                source_dataset="weekly_state_vectors",
+                source_file=source_file,
+                source_url=source_url,
+                rows_inserted=0,
+            )
+            return 0
 
         flights_by_icao24 = build_flight_lookup(flights)
         buffered_records: list[dict[str, Any]] = []
 
-        for member_name, reader in iter_csv_members_from_tar(archive_path):
+        for member_name, reader in iter_csv_members_from_tar(temp_path):
             print(f"Reading member: {member_name}")
             row_counter = 0
             match_counter = 0
@@ -790,13 +1113,13 @@ def ingest_matching_state_vectors(
                     state_row_to_record(
                         row,
                         matched_flight,
-                        source_file=archive_path.name,
+                        source_file=source_file,
                         source_member=member_name,
                     )
                 )
                 match_counter += 1
                 if len(buffered_records) >= STATE_VECTOR_INSERT_BATCH_SIZE:
-                    insert_records(
+                    total_inserted += insert_records(
                         engine,
                         "scientific_state_vectors",
                         buffered_records,
@@ -815,12 +1138,56 @@ def ingest_matching_state_vectors(
             )
 
         if buffered_records:
-            insert_records(
+            total_inserted += insert_records(
                 engine,
                 "scientific_state_vectors",
                 buffered_records,
                 conflict_columns=["flight_key", "time", "icao24", "callsign"],
             )
+
+        mark_manifest_completed(
+            engine,
+            source_dataset="weekly_state_vectors",
+            source_file=source_file,
+            source_url=source_url,
+            rows_inserted=total_inserted,
+        )
+        return total_inserted
+    except Exception as exc:
+        mark_manifest_failed(
+            engine,
+            source_dataset="weekly_state_vectors",
+            source_file=source_file,
+            source_url=source_url,
+            error_message=str(exc),
+        )
+        raise
+    finally:
+        if temp_path is not None and temp_path.exists():
+            temp_path.unlink()
+
+
+def ingest_matching_state_vectors_streaming(
+    engine: Engine,
+    state_archives: Sequence[dict[str, str]],
+    *,
+    workspace_dir: Path,
+    candidate_days: set[date],
+) -> int:
+    total_inserted = 0
+    for archive_metadata in progress(
+        state_archives,
+        desc="Ingest state vectors",
+        total=len(state_archives),
+        unit="archive",
+    ):
+        total_inserted += process_state_archive_streaming(
+            engine,
+            archive_metadata=archive_metadata,
+            workspace_dir=workspace_dir,
+            candidate_days=candidate_days,
+        )
+    return total_inserted
 
 
 def build_default_trajectory_query(
@@ -922,6 +1289,23 @@ def query_scientific_db(
     return pd.read_sql_query(text(sql_query), engine, params=sql_params)
 
 
+def select_relevant_state_archives(
+    archives: Sequence[dict[str, str]],
+    candidate_days: set[date],
+    candidate_hours: set[pd.Timestamp],
+) -> list[dict[str, str]]:
+    selected = []
+    for archive in archives:
+        archive_day = extract_date_from_name(archive["name"])
+        if archive_day is not None and candidate_days and archive_day not in candidate_days:
+            continue
+        archive_hour = extract_archive_hour_from_name(archive["name"])
+        if archive_hour is not None and candidate_hours and archive_hour not in candidate_hours:
+            continue
+        selected.append(archive)
+    return selected
+
+
 def build_scientific_db(config: BuildConfig) -> None:
     if config.state_archive_format != "csv":
         raise NotImplementedError(
@@ -930,50 +1314,63 @@ def build_scientific_db(config: BuildConfig) -> None:
 
     engine = get_engine(config.database_url)
     create_schema(engine)
+    workspace_dir = ensure_workspace(config.download_dir)
 
     covid_files = fetch_covid_file_metadata()
     if not covid_files:
         raise RuntimeError("Could not discover COVID dataset files.")
-    covid_paths = ensure_downloads(
-        covid_files,
-        config.download_dir,
-        subdir="covid",
-        limit=config.max_covid_files,
+    selected_covid_files = list(
+        covid_files[: config.max_covid_files]
+        if config.max_covid_files is not None
+        else covid_files
     )
-    ingest_filtered_covid_flights(
+    inserted_flights = ingest_filtered_covid_flights_streaming(
         engine,
-        covid_paths,
+        selected_covid_files,
+        workspace_dir=workspace_dir,
         origin_airports=config.origin_airports,
         minimum_duration_hours=config.minimum_duration_hours,
     )
+    print(f"Inserted or refreshed {inserted_flights} filtered flight rows from streaming ingest.")
 
     candidate_days = load_candidate_days_from_db(
         engine,
         origin_airports=config.origin_airports,
         minimum_duration_hours=config.minimum_duration_hours,
     )
+    candidate_hours = load_candidate_archive_hours_from_db(
+        engine,
+        origin_airports=config.origin_airports,
+        minimum_duration_hours=config.minimum_duration_hours,
+    )
     print(f"Identified {len(candidate_days)} candidate UTC days with eligible flights.")
+    print(f"Identified {len(candidate_hours)} candidate UTC hourly archives with eligible flights.")
 
     state_archives = fetch_state_archive_metadata(config.state_archive_format)
     if not state_archives:
         raise RuntimeError("Could not discover weekly state-vector archives.")
 
-    filtered_archives = [
-        archive
-        for archive in state_archives
-        if (
-            extract_date_from_name(archive["name"]) in candidate_days
-            if extract_date_from_name(archive["name"]) is not None
-            else True
-        )
-    ]
-    state_paths = ensure_downloads(
-        filtered_archives,
-        config.download_dir,
-        subdir=f"states_{config.state_archive_format}",
-        limit=config.max_state_archives,
+    filtered_archives = select_relevant_state_archives(
+        state_archives,
+        candidate_days,
+        candidate_hours,
     )
-    ingest_matching_state_vectors(engine, state_paths, candidate_days)
+    selected_state_archives = list(
+        filtered_archives[: config.max_state_archives]
+        if config.max_state_archives is not None
+        else filtered_archives
+    )
+    print(
+        "Selected "
+        f"{len(selected_state_archives)} state archives after hourly relevance filtering."
+    )
+    inserted_state_rows = ingest_matching_state_vectors_streaming(
+        engine,
+        selected_state_archives,
+        workspace_dir=workspace_dir,
+        candidate_days=candidate_days,
+    )
+    print(f"Inserted or refreshed {inserted_state_rows} matching state-vector rows.")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1000,7 +1397,10 @@ def build_parser() -> argparse.ArgumentParser:
     build_parser.add_argument(
         "--download-dir",
         required=True,
-        help="Directory for downloaded source files, e.g. an external drive path.",
+        help=(
+            "Temporary workspace directory for one-file-at-a-time source processing, "
+            "e.g. an external drive path."
+        ),
     )
     build_parser.add_argument(
         "--origin-airports",

@@ -88,6 +88,41 @@ class OpenSkyBuildScientificDbTestCase(unittest.TestCase):
             scientific_db.extract_date_from_name("states_unknown.csv.tar")
         )
 
+    def test_extract_archive_hour_from_name_returns_utc_hour(self) -> None:
+        self.assertEqual(
+            scientific_db.extract_archive_hour_from_name(
+                "states_2020-03-23-14.csv.tar"
+            ),
+            pd.Timestamp("2020-03-23 14:00:00", tz="UTC"),
+        )
+        self.assertIsNone(
+            scientific_db.extract_archive_hour_from_name("states_unknown.csv.tar")
+        )
+
+    def test_select_relevant_state_archives_filters_to_candidate_hours(self) -> None:
+        archives = [
+            {
+                "name": "states_2020-03-23-14.csv.tar",
+                "url": "https://example.com/states_2020-03-23-14.csv.tar",
+            },
+            {
+                "name": "states_2020-03-23-15.csv.tar",
+                "url": "https://example.com/states_2020-03-23-15.csv.tar",
+            },
+            {
+                "name": "states_2020-03-24-10.csv.tar",
+                "url": "https://example.com/states_2020-03-24-10.csv.tar",
+            },
+        ]
+
+        selected = scientific_db.select_relevant_state_archives(
+            archives,
+            candidate_days={pd.Timestamp("2020-03-23").date()},
+            candidate_hours={pd.Timestamp("2020-03-23 14:00:00", tz="UTC")},
+        )
+
+        self.assertEqual([item["name"] for item in selected], ["states_2020-03-23-14.csv.tar"])
+
     def test_state_row_to_record_converts_into_database_shape(self) -> None:
         flight = {
             "flight_key": "abc123|TEST123|2020-01-01T00:00:00+00:00",
