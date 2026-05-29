@@ -1,5 +1,5 @@
 Pipfile.lock
-__pycache__/*.cpython-310.pyc
+*.cpython-*.pyc
 *.DS_Store
 gan_data/
 opensky_results/*.csv
