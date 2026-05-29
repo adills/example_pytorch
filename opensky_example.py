@@ -1,12 +1,148 @@
+"""
+OpenSky long-haul flight and trajectory example.
+
+This script demonstrates a two-step workflow for retrieving long-haul flights
+from OpenSky and then building a trajectory dataset for those flights.
+
+Workflow
+--------
+Step 1:
+- Query flight metadata for departures from one origin airport within a time
+  window.
+- Filter the returned flights by minimum duration and known arrival airport.
+- Save the filtered flight list to ``long_haul_flights.csv``.
+
+Step 2:
+- Load the saved Step 1 flight metadata.
+- Fetch trajectory/state-vector data for each saved flight.
+- Append trajectory rows to ``long_distance_trajectories.csv``.
+- Generate an altitude-vs-time-since-takeoff plot as
+  ``flights_altitude_vs_time.png``.
+
+Backends
+--------
+The script supports two OpenSky backends:
+
+- ``trino``:
+  Uses the OpenSky Trino historical database. This is the default backend and
+  the preferred option for larger historical pulls.
+
+- ``rest``:
+  Uses the OpenSky REST API. This path supports chunking, retry handling, and
+  resumable Step 2 execution, but it is still constrained by REST rate limits.
+
+CLI options
+-----------
+The main user-facing options are:
+
+- ``--step 1|2|both``
+  Select which workflow step to run.
+
+- ``--backend rest|trino``
+  Select the OpenSky data backend. Default: ``trino``.
+
+- ``--origin-airport ICAO``
+  Origin airport ICAO identifier. Default: ``EGLL``.
+
+- ``--start-time "YYYY-MM-DD HH:MM:SS"``
+  Inclusive search start timestamp.
+
+- ``--end-time "YYYY-MM-DD HH:MM:SS"``
+  Inclusive search end timestamp.
+
+- ``--minimum-duration-hours FLOAT``
+  Minimum duration threshold used to classify long-haul flights.
+
+Example commands
+----------------
+Run Step 1 with Trino:
+
+    python opensky_example.py --step 1 --backend trino
+
+Run Step 2 with Trino:
+
+    python opensky_example.py --step 2 --backend trino
+
+Run Step 1 with REST:
+
+    python opensky_example.py --step 1 --backend rest
+
+Resume a rate-limited REST Step 2 run:
+
+    python opensky_example.py --step 2 --backend rest
+
+Requirements
+------------
+Python dependencies:
+
+- pandas
+- matplotlib
+- pyopensky
+- httpx
+
+Backend-specific requirements:
+
+- REST backend:
+  Configure OpenSky REST credentials if you want authenticated access.
+  ``pyopensky.rest.REST`` reads credentials from the standard pyopensky config.
+
+- Trino backend:
+  You must have Trino access enabled by OpenSky and valid Trino credentials in
+  the pyopensky settings file, typically:
+
+      /Users/[username]/Library/Application Support/pyopensky/settings.conf
+
+Output files
+------------
+- ``long_haul_flights.csv``:
+  Filtered Step 1 flight metadata.
+
+- ``long_distance_trajectories.csv``:
+  Step 2 trajectory/state-vector output written in a Trino-style schema for
+  both backends.
+
+- ``flights_altitude_vs_time.png``:
+  Plot generated from the saved Step 2 data. The plot prefers ``geoaltitude``
+  when available and falls back to ``baroaltitude``.
+
+Testing
+-------
+Unit tests live in ``tests/test_opensky_example.py``.
+
+Run the built-in unittest suite with the project virtual environment:
+
+    pipenv run python -m unittest discover -s tests -v
+
+If using pytest, make sure the project root is importable:
+
+    PYTHONPATH=. pipenv run pytest tests/test_opensky_example.py -v
+
+Notes
+-----
+- Step 2 is resumable because completed flights are tracked via ``flight_key``
+  values already present in the Step 2 output CSV.
+- REST Step 2 may stop at a rate-limit checkpoint and print a retry/resume
+  command.
+- Trino Step 2 can return much richer state-vector data than REST, even though
+  both backends are normalized into one common output schema.
+"""
+
 import argparse
+from dataclasses import dataclass
 from pathlib import Path
 import sys
 import time
+from typing import Any, Literal
 
 import httpx
 import matplotlib
 import pandas as pd
 from pyopensky.rest import REST
+from pyopensky.trino import Trino
+
+
+BackendName = Literal["rest", "trino"]
+StepName = Literal["1", "2", "both"]
 
 
 def configure_matplotlib_backend() -> bool:
@@ -26,35 +162,10 @@ import matplotlib.pyplot as plt
 
 
 SCRIPT_DIR = Path(__file__).parent
-STEP_1_OUTPUT_PATH = SCRIPT_DIR / "long_haul_flights.csv"
-STEP_2_OUTPUT_PATH = SCRIPT_DIR / "long_distance_trajectories.csv"
-PLOT_OUTPUT_PATH = SCRIPT_DIR / "flights_altitude_vs_time.png"
+DEFAULT_STEP_1_OUTPUT_PATH = SCRIPT_DIR / "long_haul_flights.csv"
+DEFAULT_STEP_2_OUTPUT_PATH = SCRIPT_DIR / "long_distance_trajectories.csv"
+DEFAULT_PLOT_OUTPUT_PATH = SCRIPT_DIR / "flights_altitude_vs_time.png"
 
-# STEP 1 metadata is saved to long_haul_flights.csv:
-# icao24
-# callsign
-# estDepartureAirport
-# estArrivalAirport
-# firstSeen
-# lastSeen
-# duration_hours
-# flight_key
-
-# STEP 2 This step is time-consuming and should be run separately after Step 1 
-# completes.
-# time
-# lat
-# lon
-# altitude_m
-# true_track_deg
-
-# OpenSky REST client.
-# Authentication is optional for public endpoints, but authenticated access
-# raises rate limits. pyopensky reads credentials from:
-# - OPENSKY_CLIENT_ID / OPENSKY_CLIENT_SECRET for bearer-token auth
-# - OPENSKY_USERNAME / OPENSKY_PASSWORD are still useful for your account,
-#   but this REST client primarily uses client credentials when available.
-api = REST()
 REST_INTERVAL_LIMIT = pd.Timedelta(days=2)
 REST_CHUNK_RETRY_ATTEMPTS = 3
 REST_CHUNK_RETRY_SLEEP_SECONDS = 2
@@ -64,10 +175,66 @@ REST_TRACK_MAX_RETRY_AFTER_SECONDS = 30
 TRACK_REQUEST_COOLDOWN_SECONDS = 5
 STEP_2_DEFAULT_RETRY_WAIT_SECONDS = 3600
 
+DEFAULT_BACKEND: BackendName = "trino"
+DEFAULT_STEP: StepName = "1"
 DEFAULT_ORIGIN_AIRPORT = "EGLL"  # London Heathrow
 DEFAULT_START_TIME = "2026-01-24 00:00:00"
 DEFAULT_END_TIME = "2026-05-24 23:59:59"
 DEFAULT_MINIMUM_DURATION_HOURS = 6
+TRINO_CREDENTIALS_HINT = (
+    "/Users/anthonydills/Library/Application Support/pyopensky/settings.conf"
+)
+STEP_2_SCHEMA_COLUMNS = [
+    "time",
+    "icao24",
+    "lat",
+    "lon",
+    "velocity",
+    "heading",
+    "vertrate",
+    "callsign",
+    "onground",
+    "alert",
+    "spi",
+    "squawk",
+    "baroaltitude",
+    "geoaltitude",
+    "lastposupdate",
+    "lastcontact",
+    "serials",
+    "hour",
+    "flight_key",
+    "origin",
+    "destination",
+    "first_seen",
+    "last_seen",
+    "duration_hours",
+    "source_backend",
+]
+
+
+@dataclass(frozen=True)
+class OutputPaths:
+    step_1_output_path: Path = DEFAULT_STEP_1_OUTPUT_PATH
+    step_2_output_path: Path = DEFAULT_STEP_2_OUTPUT_PATH
+    plot_output_path: Path = DEFAULT_PLOT_OUTPUT_PATH
+
+
+@dataclass(frozen=True)
+class RunConfig:
+    backend: BackendName
+    step: StepName
+    origin_airport: str
+    start_time: str
+    end_time: str
+    minimum_duration_hours: float
+    paths: OutputPaths
+
+
+class Step2RateLimitError(RuntimeError):
+    def __init__(self, response: httpx.Response):
+        super().__init__(f"Rate limited with HTTP {response.status_code}")
+        self.response = response
 
 
 def build_flight_key(
@@ -80,7 +247,71 @@ def build_flight_key(
     return f"{icao24}|{callsign_clean}|{first_seen_ts.isoformat()}"
 
 
-def plot_altitude_vs_time_since_takeoff(trajectory_df: pd.DataFrame) -> None:
+def make_backend_client(backend: BackendName) -> REST | Trino:
+    if backend == "rest":
+        return REST()
+    return Trino()
+
+
+def build_run_config(args: argparse.Namespace) -> RunConfig:
+    return RunConfig(
+        backend=args.backend,
+        step=args.step,
+        origin_airport=args.origin_airport,
+        start_time=args.start_time,
+        end_time=args.end_time,
+        minimum_duration_hours=args.minimum_duration_hours,
+        paths=OutputPaths(),
+    )
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Fetch long-haul flight metadata and trajectories from "
+            "OpenSky REST or Trino."
+        )
+    )
+    parser.add_argument(
+        "--step",
+        choices=["1", "2", "both"],
+        default=DEFAULT_STEP,
+        help="Which workflow step to run: 1, 2, or both.",
+    )
+    parser.add_argument(
+        "--backend",
+        choices=["rest", "trino"],
+        default=DEFAULT_BACKEND,
+        help="Data backend to use. Trino is the default for bulk history.",
+    )
+    parser.add_argument(
+        "--origin-airport",
+        default=DEFAULT_ORIGIN_AIRPORT,
+        help="Origin airport ICAO code for the departure search.",
+    )
+    parser.add_argument(
+        "--start-time",
+        default=DEFAULT_START_TIME,
+        help="Inclusive departure search start timestamp.",
+    )
+    parser.add_argument(
+        "--end-time",
+        default=DEFAULT_END_TIME,
+        help="Inclusive departure search end timestamp.",
+    )
+    parser.add_argument(
+        "--minimum-duration-hours",
+        type=float,
+        default=DEFAULT_MINIMUM_DURATION_HOURS,
+        help="Minimum duration in hours for a flight to count as long-haul.",
+    )
+    return parser.parse_args()
+
+
+def plot_altitude_vs_time_since_takeoff(
+    trajectory_df: pd.DataFrame,
+    plot_output_path: Path,
+) -> None:
     fig, ax = plt.subplots(figsize=(10, 6))
 
     for (_, callsign, destination), flight_df in trajectory_df.groupby(
@@ -88,6 +319,7 @@ def plot_altitude_vs_time_since_takeoff(trajectory_df: pd.DataFrame) -> None:
     ):
         flight_df = flight_df.sort_values("time").copy()
         first_time = flight_df["time"].iloc[0]
+        flight_df["plot_altitude_m"] = select_altitude_for_plot(flight_df)
         flight_df["hours_since_takeoff"] = (
             pd.to_datetime(flight_df["time"]) - pd.to_datetime(first_time)
         ).dt.total_seconds() / 3600
@@ -95,7 +327,7 @@ def plot_altitude_vs_time_since_takeoff(trajectory_df: pd.DataFrame) -> None:
         label = f"{str(callsign).strip()} -> {destination}"
         ax.plot(
             flight_df["hours_since_takeoff"],
-            flight_df["altitude_m"],
+            flight_df["plot_altitude_m"],
             label=label,
         )
 
@@ -105,83 +337,26 @@ def plot_altitude_vs_time_since_takeoff(trajectory_df: pd.DataFrame) -> None:
     ax.grid(True, alpha=0.3)
     ax.legend()
     fig.tight_layout()
-    fig.savefig(PLOT_OUTPUT_PATH, dpi=150)
-    print(f"Saved plot to {PLOT_OUTPUT_PATH}")
+    fig.savefig(plot_output_path, dpi=150)
+    print(f"Saved plot to {plot_output_path}")
     if interactive_backend:
         plt.show()
     plt.close(fig)
 
 
-def fetch_departures_for_interval(
-    api: REST,
-    airport: str,
-    begin: str | pd.Timestamp,
-    end: str | pd.Timestamp,
-) -> pd.DataFrame:
-    begin_ts = pd.Timestamp(begin)
-    end_ts = pd.Timestamp(end)
+def select_altitude_for_plot(trajectory_df: pd.DataFrame) -> pd.Series:
+    geoaltitude = trajectory_df.get("geoaltitude")
+    if geoaltitude is None:
+        geoaltitude = pd.Series(pd.NA, index=trajectory_df.index, dtype="Float64")
 
-    if end_ts <= begin_ts:
-        raise ValueError("end must be later than begin")
+    baroaltitude = trajectory_df.get("baroaltitude")
+    if baroaltitude is None:
+        baroaltitude = pd.Series(pd.NA, index=trajectory_df.index, dtype="Float64")
 
-    interval = end_ts - begin_ts
-    if interval <= REST_INTERVAL_LIMIT:
-        print(f"Fetching departures from {begin_ts} to {end_ts}...")
-        return fetch_departure_chunk(
-            api=api,
-            airport=airport,
-            begin=begin_ts,
-            end=end_ts,
-        )
-
-    print(
-        f"Requested interval is {interval}. "
-        f"Chunking into {REST_INTERVAL_LIMIT} REST requests..."
-    )
-
-    all_chunks: list[pd.DataFrame] = []
-    current_start = begin_ts
-
-    while current_start < end_ts:
-        current_end = min(current_start + REST_INTERVAL_LIMIT, end_ts)
-        print(f"Fetching departures from {current_start} to {current_end}...")
-
-        chunk_df = fetch_departure_chunk(
-            api=api,
-            airport=airport,
-            begin=current_start,
-            end=current_end,
-        )
-
-        if not chunk_df.empty:
-            all_chunks.append(chunk_df)
-
-        current_start = current_end
-
-    if not all_chunks:
-        return pd.DataFrame()
-
-    stitched_df = pd.concat(all_chunks, ignore_index=True)
-    dedupe_columns = [
-        "firstSeen",
-        "lastSeen",
-        "icao24",
-        "callsign",
-        "estDepartureAirport",
-        "estArrivalAirport",
-    ]
-    available_dedupe_columns = [
-        column for column in dedupe_columns if column in stitched_df.columns
-    ]
-    if available_dedupe_columns:
-        stitched_df = stitched_df.drop_duplicates(
-            subset=available_dedupe_columns
-        ).reset_index(drop=True)
-
-    return stitched_df
+    return geoaltitude.fillna(baroaltitude)
 
 
-def fetch_departure_chunk(
+def fetch_departure_chunk_rest(
     api: REST,
     airport: str,
     begin: pd.Timestamp,
@@ -216,7 +391,85 @@ def fetch_departure_chunk(
     return chunk_df
 
 
-def fetch_track_chunk(
+def fetch_departures_for_interval_rest(
+    api: REST,
+    airport: str,
+    begin: str | pd.Timestamp,
+    end: str | pd.Timestamp,
+) -> pd.DataFrame:
+    begin_ts = pd.Timestamp(begin)
+    end_ts = pd.Timestamp(end)
+
+    if end_ts <= begin_ts:
+        raise ValueError("end must be later than begin")
+
+    interval = end_ts - begin_ts
+    if interval <= REST_INTERVAL_LIMIT:
+        print(f"Fetching departures from {begin_ts} to {end_ts}...")
+        return fetch_departure_chunk_rest(
+            api=api,
+            airport=airport,
+            begin=begin_ts,
+            end=end_ts,
+        )
+
+    total_chunks = int(interval / REST_INTERVAL_LIMIT)
+    if interval % REST_INTERVAL_LIMIT != pd.Timedelta(0):
+        total_chunks += 1
+
+    print(
+        f"Requested interval is {interval}. "
+        f"Chunking into {total_chunks} REST requests..."
+    )
+
+    all_chunks: list[pd.DataFrame] = []
+    current_start = begin_ts
+    chunk_index = 1
+
+    while current_start < end_ts:
+        current_end = min(current_start + REST_INTERVAL_LIMIT, end_ts)
+        print(
+            f"[{chunk_index}/{total_chunks}] Fetching departures from "
+            f"{current_start} to {current_end}..."
+        )
+
+        chunk_df = fetch_departure_chunk_rest(
+            api=api,
+            airport=airport,
+            begin=current_start,
+            end=current_end,
+        )
+
+        if not chunk_df.empty:
+            all_chunks.append(chunk_df)
+
+        current_start = current_end
+        chunk_index += 1
+
+    if not all_chunks:
+        return pd.DataFrame()
+
+    stitched_df = pd.concat(all_chunks, ignore_index=True)
+    dedupe_columns = [
+        "firstSeen",
+        "lastSeen",
+        "icao24",
+        "callsign",
+        "estDepartureAirport",
+        "estArrivalAirport",
+    ]
+    available_dedupe_columns = [
+        column for column in dedupe_columns if column in stitched_df.columns
+    ]
+    if available_dedupe_columns:
+        stitched_df = stitched_df.drop_duplicates(
+            subset=available_dedupe_columns
+        ).reset_index(drop=True)
+
+    return stitched_df
+
+
+def fetch_track_chunk_rest(
     api: REST,
     icao24: str,
     ts: str | pd.Timestamp,
@@ -231,10 +484,10 @@ def fetch_track_chunk(
         if status_code == 404:
             return pd.DataFrame()
 
-        if status_code in (429, 503):
-            if attempt == REST_TRACK_RETRY_ATTEMPTS:
-                response.raise_for_status()
+        if status_code == 429 and attempt == REST_TRACK_RETRY_ATTEMPTS:
+            raise Step2RateLimitError(response)
 
+        if status_code in (429, 503):
             retry_after_header = response.headers.get(
                 "X-Rate-Limit-Retry-After-Seconds"
             )
@@ -287,6 +540,44 @@ def fetch_track_chunk(
     return pd.DataFrame()
 
 
+def fetch_flights_step_1_rest(
+    config: RunConfig,
+    client: REST,
+) -> pd.DataFrame:
+    flights_df = fetch_departures_for_interval_rest(
+        api=client,
+        airport=config.origin_airport,
+        begin=config.start_time,
+        end=config.end_time,
+    )
+    if flights_df.empty:
+        return flights_df
+    return flights_df.assign(source_backend="rest")
+
+
+def fetch_flights_step_1_trino(
+    config: RunConfig,
+    client: Trino,
+) -> pd.DataFrame:
+    flights_df = client.flightlist(
+        start=config.start_time,
+        stop=config.end_time,
+        departure_airport=config.origin_airport,
+    )
+    if flights_df is None or flights_df.empty:
+        return pd.DataFrame()
+
+    normalized_df = flights_df.rename(
+        columns={
+            "departure": "estDepartureAirport",
+            "arrival": "estArrivalAirport",
+            "firstseen": "firstSeen",
+            "lastseen": "lastSeen",
+        }
+    )
+    return normalized_df.assign(source_backend="trino")
+
+
 def prepare_long_haul_flights(
     flights_df: pd.DataFrame,
     minimum_duration_hours: float,
@@ -303,7 +594,9 @@ def prepare_long_haul_flights(
         .copy()
     )
 
-    long_haul_flights["callsign"] = long_haul_flights["callsign"].astype(str).str.strip()
+    long_haul_flights["callsign"] = (
+        long_haul_flights["callsign"].astype(str).str.strip()
+    )
     long_haul_flights["flight_key"] = long_haul_flights.apply(
         lambda row: build_flight_key(
             row["icao24"],
@@ -315,37 +608,40 @@ def prepare_long_haul_flights(
     return long_haul_flights.reset_index(drop=True)
 
 
-def save_step_1_results(long_haul_flights: pd.DataFrame) -> None:
-    long_haul_flights.to_csv(STEP_1_OUTPUT_PATH, index=False)
+def save_step_1_results(
+    long_haul_flights: pd.DataFrame,
+    output_path: Path,
+) -> None:
+    long_haul_flights.to_csv(output_path, index=False)
     print(
         f"Saved {len(long_haul_flights)} long-haul flight records to "
-        f"{STEP_1_OUTPUT_PATH}"
+        f"{output_path}"
     )
 
 
-def load_step_1_results() -> pd.DataFrame:
-    if not STEP_1_OUTPUT_PATH.exists():
+def load_step_1_results(step_1_output_path: Path) -> pd.DataFrame:
+    if not step_1_output_path.exists():
         raise FileNotFoundError(
-            f"Step 1 output not found: {STEP_1_OUTPUT_PATH}. Run Step 1 first."
+            f"Step 1 output not found: {step_1_output_path}. Run Step 1 first."
         )
 
     return pd.read_csv(
-        STEP_1_OUTPUT_PATH,
+        step_1_output_path,
         parse_dates=["firstSeen", "lastSeen"],
     )
 
 
-def normalize_track_dataframe(
+def normalize_rest_track_dataframe(
     track_df: pd.DataFrame,
     flight: pd.Series,
 ) -> pd.DataFrame:
-    return track_df.rename(
+    normalized_df = track_df.rename(
         columns={
             "timestamp": "time",
             "latitude": "lat",
             "longitude": "lon",
-            "altitude": "altitude_m",
-            "track": "true_track_deg",
+            "altitude": "baroaltitude",
+            "track": "heading",
         }
     ).assign(
         flight_key=flight["flight_key"],
@@ -354,33 +650,87 @@ def normalize_track_dataframe(
         first_seen=flight["firstSeen"],
         last_seen=flight["lastSeen"],
         duration_hours=flight["duration_hours"],
+        source_backend="rest",
+        velocity=pd.NA,
+        vertrate=pd.NA,
+        alert=pd.NA,
+        spi=pd.NA,
+        squawk=pd.NA,
+        geoaltitude=pd.NA,
+        lastposupdate=pd.NA,
+        lastcontact=pd.NA,
+        serials=pd.NA,
     )
+    normalized_df["hour"] = pd.to_datetime(normalized_df["time"]).dt.floor("h")
+    return standardize_step_2_schema(normalized_df)
 
 
-def load_completed_flight_keys() -> set[str]:
-    if not STEP_2_OUTPUT_PATH.exists():
+def fetch_track_chunk_trino(
+    client: Trino,
+    flight: pd.Series,
+) -> pd.DataFrame:
+    history_df = client.history(
+        start=flight["firstSeen"],
+        stop=flight["lastSeen"],
+        icao24=flight["icao24"],
+        callsign=flight["callsign"],
+    )
+    if history_df is None or history_df.empty:
+        return pd.DataFrame()
+    return history_df
+
+
+def normalize_trino_track_dataframe(
+    track_df: pd.DataFrame,
+    flight: pd.Series,
+) -> pd.DataFrame:
+    normalized_df = track_df.assign(
+        flight_key=flight["flight_key"],
+        origin=flight["estDepartureAirport"],
+        destination=flight["estArrivalAirport"],
+        first_seen=flight["firstSeen"],
+        last_seen=flight["lastSeen"],
+        duration_hours=flight["duration_hours"],
+        source_backend="trino",
+    )
+    return standardize_step_2_schema(normalized_df)
+
+
+def standardize_step_2_schema(track_df: pd.DataFrame) -> pd.DataFrame:
+    normalized_df = track_df.copy()
+    for column in STEP_2_SCHEMA_COLUMNS:
+        if column not in normalized_df.columns:
+            normalized_df[column] = pd.NA
+    return normalized_df.loc[:, STEP_2_SCHEMA_COLUMNS]
+
+
+def load_completed_flight_keys(step_2_output_path: Path) -> set[str]:
+    if not step_2_output_path.exists():
         return set()
 
-    completed_df = pd.read_csv(STEP_2_OUTPUT_PATH, usecols=["flight_key"])
+    completed_df = pd.read_csv(step_2_output_path, usecols=["flight_key"])
     return set(completed_df["flight_key"].dropna().astype(str).unique())
 
 
-def append_tracks_to_output(track_df: pd.DataFrame) -> None:
-    write_header = not STEP_2_OUTPUT_PATH.exists()
+def append_tracks_to_output(
+    track_df: pd.DataFrame,
+    step_2_output_path: Path,
+) -> None:
+    write_header = not step_2_output_path.exists()
     track_df.to_csv(
-        STEP_2_OUTPUT_PATH,
+        step_2_output_path,
         mode="a",
         header=write_header,
         index=False,
     )
 
 
-def load_step_2_results() -> pd.DataFrame:
-    if not STEP_2_OUTPUT_PATH.exists():
+def load_step_2_results(step_2_output_path: Path) -> pd.DataFrame:
+    if not step_2_output_path.exists():
         return pd.DataFrame()
 
     return pd.read_csv(
-        STEP_2_OUTPUT_PATH,
+        step_2_output_path,
         parse_dates=["time", "first_seen", "last_seen"],
     )
 
@@ -421,9 +771,10 @@ def print_step_2_checkpoint(
     completed_count: int,
     remaining_count: int,
     response: httpx.Response | None,
+    backend: BackendName,
 ) -> None:
     retry_timestamp_utc, retry_reason = estimate_step_2_retry_time(response)
-    retry_command = "python opensky_example.py --step 2"
+    retry_command = f"python opensky_example.py --step 2 --backend {backend}"
 
     print("\n--- Step 2 Checkpoint ---")
     print(
@@ -440,82 +791,59 @@ def print_step_2_checkpoint(
     print(f"Resume with: {retry_command}")
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Fetch long-haul flight metadata and trajectories from OpenSky REST."
-    )
-    parser.add_argument(
-        "--step",
-        choices=["1", "2", "both"],
-        default="1",
-        help="Which workflow step to run: 1, 2, or both.",
-    )
-    parser.add_argument(
-        "--origin-airport",
-        default=DEFAULT_ORIGIN_AIRPORT,
-        help="Origin airport ICAO code for the departure search.",
-    )
-    parser.add_argument(
-        "--start-time",
-        default=DEFAULT_START_TIME,
-        help="Inclusive departure search start timestamp.",
-    )
-    parser.add_argument(
-        "--end-time",
-        default=DEFAULT_END_TIME,
-        help="Inclusive departure search end timestamp.",
-    )
-    parser.add_argument(
-        "--minimum-duration-hours",
-        type=float,
-        default=DEFAULT_MINIMUM_DURATION_HOURS,
-        help="Minimum duration in hours for a flight to count as long-haul.",
-    )
-    return parser.parse_args()
-
-
-def run_step_1(
-    origin_airport: str,
-    start_time: str,
-    end_time: str,
-    minimum_duration_hours: float,
+def print_step_2_summary(
+    final_trajectory_df: pd.DataFrame,
+    config: RunConfig,
+    stopped_early: bool,
 ) -> None:
-    print(f"--- Step 1: Fetching departed flights from {origin_airport} via REST ---")
+    if final_trajectory_df.empty:
+        print("No trajectory rows have been saved yet.")
+        return
 
-    try:
-        flights_df = fetch_departures_for_interval(
-            api=api,
-            airport=origin_airport,
-            begin=start_time,
-            end=end_time,
-        )
-    except httpx.HTTPStatusError as exc:
-        if exc.response.status_code == 404:
-            print("No flights found for the specified timeframe.")
-        else:
-            print(f"Error fetching departures: {exc}")
-        raise SystemExit(1)
-    except Exception as exc:
-        print(f"Unexpected error fetching departures: {exc}")
-        raise SystemExit(1)
+    columns_to_show = [
+        "time",
+        "icao24",
+        "callsign",
+        "lat",
+        "lon",
+        "baroaltitude",
+        "geoaltitude",
+        "heading",
+        "origin",
+        "destination",
+    ]
+    print("\n--- Trajectory Sample ---")
+    print(final_trajectory_df[columns_to_show].head())
+    plot_altitude_vs_time_since_takeoff(
+        final_trajectory_df,
+        config.paths.plot_output_path,
+    )
+    print(f"Trajectory output is stored at {config.paths.step_2_output_path}")
+    if stopped_early:
+        print("Step 2 paused at a rate-limit checkpoint. Resume with:")
+        print(f"python opensky_example.py --step 2 --backend {config.backend}")
 
+
+def run_step_1_rest(
+    config: RunConfig,
+    client: REST,
+) -> None:
+    print(
+        f"--- Step 1 ({config.backend}): Fetching departed flights from "
+        f"{config.origin_airport} ---"
+    )
+    flights_df = fetch_flights_step_1_rest(config, client)
     if flights_df.empty:
         print("No flights returned by the REST API for that airport and time window.")
         raise SystemExit(0)
 
-    try:
-        long_haul_flights = prepare_long_haul_flights(
-            flights_df,
-            minimum_duration_hours=minimum_duration_hours,
-        )
-    except KeyError as exc:
-        print("Expected flight timing columns were not returned by the REST API.")
-        print(f"Error: {exc}")
-        raise SystemExit(1)
-
+    long_haul_flights = prepare_long_haul_flights(
+        flights_df,
+        minimum_duration_hours=config.minimum_duration_hours,
+    )
     print(
         f"Found {len(long_haul_flights)} flights with duration >= "
-        f"{minimum_duration_hours} hours and a known arrival airport."
+        f"{config.minimum_duration_hours} hours and a known arrival airport."
     )
     if long_haul_flights.empty:
         raise SystemExit(0)
@@ -531,22 +859,73 @@ def run_step_1(
                 "lastSeen",
                 "duration_hours",
                 "flight_key",
+                "source_backend",
             ]
         ].head()
     )
-    save_step_1_results(long_haul_flights)
+    save_step_1_results(long_haul_flights, config.paths.step_1_output_path)
 
 
-def run_step_2() -> None:
-    print("\n--- Step 2: Fetching trajectories from saved Step 1 results ---")
-
+def run_step_1_trino(
+    config: RunConfig,
+    client: Trino,
+) -> None:
+    print(
+        f"--- Step 1 ({config.backend}): Fetching departed flights from "
+        f"{config.origin_airport} ---"
+    )
     try:
-        long_haul_flights = load_step_1_results()
-    except FileNotFoundError as exc:
-        print(exc)
-        raise SystemExit(1)
+        flights_df = fetch_flights_step_1_trino(config, client)
+    except Exception as exc:
+        raise RuntimeError(
+            "Trino Step 1 failed. Check that your Trino access is enabled and "
+            f"your credentials are configured in {TRINO_CREDENTIALS_HINT}. "
+            "You can retry with --backend rest if needed."
+        ) from exc
 
-    completed_flight_keys = load_completed_flight_keys()
+    if flights_df.empty:
+        print("No flights returned by Trino for that airport and time window.")
+        raise SystemExit(0)
+
+    long_haul_flights = prepare_long_haul_flights(
+        flights_df,
+        minimum_duration_hours=config.minimum_duration_hours,
+    )
+    print(
+        f"Found {len(long_haul_flights)} flights with duration >= "
+        f"{config.minimum_duration_hours} hours and a known arrival airport."
+    )
+    if long_haul_flights.empty:
+        raise SystemExit(0)
+
+    print(
+        long_haul_flights[
+            [
+                "callsign",
+                "icao24",
+                "estDepartureAirport",
+                "estArrivalAirport",
+                "firstSeen",
+                "lastSeen",
+                "duration_hours",
+                "flight_key",
+                "source_backend",
+            ]
+        ].head()
+    )
+    save_step_1_results(long_haul_flights, config.paths.step_1_output_path)
+
+
+def run_step_2_rest(
+    config: RunConfig,
+    client: REST,
+) -> None:
+    print("\n--- Step 2 (rest): Fetching trajectories from saved Step 1 results ---")
+
+    long_haul_flights = load_step_1_results(config.paths.step_1_output_path)
+    completed_flight_keys = load_completed_flight_keys(
+        config.paths.step_2_output_path
+    )
     pending_flights = long_haul_flights[
         ~long_haul_flights["flight_key"].astype(str).isin(completed_flight_keys)
     ].copy()
@@ -557,37 +936,39 @@ def run_step_2() -> None:
         f"{len(pending_flights)} remain."
     )
 
-    step_2_stopped_early = False
+    stopped_early = False
+    total_pending = len(pending_flights)
     for position, (_, flight) in enumerate(pending_flights.iterrows(), start=1):
         print(
-            "Fetching track for flight "
+            f"[{position}/{total_pending}] Fetching track for flight "
             f"{flight['callsign']} heading to {flight['estArrivalAirport']}..."
         )
 
         try:
-            track_df = fetch_track_chunk(
-                api=api,
+            track_df = fetch_track_chunk_rest(
+                api=client,
                 icao24=flight["icao24"],
                 ts=flight["firstSeen"],
             )
+        except Step2RateLimitError as exc:
+            stopped_early = True
+            print_step_2_checkpoint(
+                current_flight=flight,
+                completed_count=len(completed_flight_keys),
+                remaining_count=total_pending - position + 1,
+                response=exc.response,
+                backend="rest",
+            )
+            break
         except httpx.HTTPStatusError as exc:
-            if exc.response.status_code == 429:
-                step_2_stopped_early = True
-                print_step_2_checkpoint(
-                    current_flight=flight,
-                    completed_count=len(completed_flight_keys),
-                    remaining_count=len(pending_flights) - position + 1,
-                    response=exc.response,
-                )
-            else:
-                print(
-                    f"Stopping on {flight['callsign']} ({flight['icao24']}): "
-                    f"REST track lookup failed with HTTP {exc.response.status_code}."
-                )
-                print(
-                    "Step 2 is resumable. Re-run later and it will continue "
-                    "from the remaining flights."
-                )
+            print(
+                f"Stopping on {flight['callsign']} ({flight['icao24']}): "
+                f"REST track lookup failed with HTTP {exc.response.status_code}."
+            )
+            print(
+                "Step 2 is resumable. Re-run later and it will continue "
+                "from the remaining flights."
+            )
             break
         except Exception as exc:
             print(
@@ -599,54 +980,114 @@ def run_step_2() -> None:
         if track_df.empty:
             continue
 
-        normalized_track_df = normalize_track_dataframe(track_df, flight)
-        append_tracks_to_output(normalized_track_df)
+        normalized_track_df = normalize_rest_track_dataframe(track_df, flight)
+        append_tracks_to_output(
+            normalized_track_df,
+            config.paths.step_2_output_path,
+        )
         completed_flight_keys.add(str(flight["flight_key"]))
 
         print(
             f"Saved {len(normalized_track_df)} trajectory rows for "
-            f"{flight['callsign']} to {STEP_2_OUTPUT_PATH}"
+            f"{flight['callsign']} to {config.paths.step_2_output_path}"
         )
         time.sleep(TRACK_REQUEST_COOLDOWN_SECONDS)
 
-    final_trajectory_df = load_step_2_results()
-    if final_trajectory_df.empty:
-        print("No trajectory rows have been saved yet.")
+    final_trajectory_df = load_step_2_results(config.paths.step_2_output_path)
+    print_step_2_summary(final_trajectory_df, config, stopped_early)
+
+
+def run_step_2_trino(
+    config: RunConfig,
+    client: Trino,
+) -> None:
+    print("\n--- Step 2 (trino): Fetching trajectories from saved Step 1 results ---")
+
+    long_haul_flights = load_step_1_results(config.paths.step_1_output_path)
+    completed_flight_keys = load_completed_flight_keys(
+        config.paths.step_2_output_path
+    )
+    pending_flights = long_haul_flights[
+        ~long_haul_flights["flight_key"].astype(str).isin(completed_flight_keys)
+    ].copy()
+
+    print(
+        f"Loaded {len(long_haul_flights)} saved flights. "
+        f"{len(completed_flight_keys)} already have trajectory rows. "
+        f"{len(pending_flights)} remain."
+    )
+
+    total_pending = len(pending_flights)
+    for position, (_, flight) in enumerate(pending_flights.iterrows(), start=1):
+        print(
+            f"[{position}/{total_pending}] Fetching Trino history for flight "
+            f"{flight['callsign']} heading to {flight['estArrivalAirport']}..."
+        )
+
+        try:
+            track_df = fetch_track_chunk_trino(client, flight)
+        except Exception as exc:
+            raise RuntimeError(
+                "Trino Step 2 failed. Check that your Trino access is enabled "
+                f"and your credentials are configured in {TRINO_CREDENTIALS_HINT}. "
+                "You can retry later with --backend trino."
+            ) from exc
+
+        if track_df.empty:
+            continue
+
+        normalized_track_df = normalize_trino_track_dataframe(track_df, flight)
+        append_tracks_to_output(
+            normalized_track_df,
+            config.paths.step_2_output_path,
+        )
+        completed_flight_keys.add(str(flight["flight_key"]))
+
+        print(
+            f"Saved {len(normalized_track_df)} trajectory rows for "
+            f"{flight['callsign']} to {config.paths.step_2_output_path}"
+        )
+
+    final_trajectory_df = load_step_2_results(config.paths.step_2_output_path)
+    print_step_2_summary(final_trajectory_df, config, stopped_early=False)
+
+
+def run_step_1(
+    config: RunConfig,
+    client: REST | Trino,
+) -> None:
+    if config.backend == "rest":
+        assert isinstance(client, REST)
+        run_step_1_rest(config, client)
         return
 
-    columns_to_show = [
-        "time",
-        "icao24",
-        "callsign",
-        "lat",
-        "lon",
-        "altitude_m",
-        "true_track_deg",
-        "origin",
-        "destination",
-    ]
-    print("\n--- Trajectory Sample ---")
-    print(final_trajectory_df[columns_to_show].head())
-    plot_altitude_vs_time_since_takeoff(final_trajectory_df)
-    print(f"Trajectory output is stored at {STEP_2_OUTPUT_PATH}")
-    if step_2_stopped_early:
-        print("Step 2 paused at a rate-limit checkpoint. Resume with:")
-        print("python opensky_example.py --step 2")
+    assert isinstance(client, Trino)
+    run_step_1_trino(config, client)
+
+
+def run_step_2(
+    config: RunConfig,
+    client: REST | Trino,
+) -> None:
+    if config.backend == "rest":
+        assert isinstance(client, REST)
+        run_step_2_rest(config, client)
+        return
+
+    assert isinstance(client, Trino)
+    run_step_2_trino(config, client)
 
 
 def main() -> None:
     args = parse_args()
+    config = build_run_config(args)
+    client = make_backend_client(config.backend)
 
-    if args.step in {"1", "both"}:
-        run_step_1(
-            origin_airport=args.origin_airport,
-            start_time=args.start_time,
-            end_time=args.end_time,
-            minimum_duration_hours=args.minimum_duration_hours,
-        )
+    if config.step in {"1", "both"}:
+        run_step_1(config, client)
 
-    if args.step in {"2", "both"}:
-        run_step_2()
+    if config.step in {"2", "both"}:
+        run_step_2(config, client)
 
 
 if __name__ == "__main__":
