@@ -168,3 +168,7 @@ python neural_sysEq_parameters_ft_reduxtime.py --num_epochs 50 --delta_t 1 --tN 
 ```
 
 These will generate plots and save PNGs summarizing model accuracy and uncertainty across various data reduction levels.
+
+## Example of pulling aircraft state vector data
+
+## Example of using a GAN to synthasize more data
