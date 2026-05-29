@@ -6,6 +6,19 @@ import opensky_build_scientific_db as scientific_db
 
 
 class OpenSkyBuildScientificDbTestCase(unittest.TestCase):
+    def test_build_parser_defaults_to_local_opensky_scientific_database(self) -> None:
+        parser = scientific_db.build_parser()
+
+        build_args = parser.parse_args(
+            ["build", "--download-dir", "/tmp/opensky"]
+        )
+        query_args = parser.parse_args(["query"])
+
+        self.assertIn("opensky_scientific", build_args.database_url)
+        self.assertIn("@localhost/", build_args.database_url)
+        self.assertEqual(build_args.database_url, scientific_db.DEFAULT_DATABASE_URL)
+        self.assertEqual(query_args.database_url, scientific_db.DEFAULT_DATABASE_URL)
+
     def test_filter_covid_chunk_keeps_only_selected_origins_and_long_flights(self) -> None:
         chunk = pd.DataFrame(
             {

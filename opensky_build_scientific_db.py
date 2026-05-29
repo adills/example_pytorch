@@ -46,13 +46,11 @@ CLI
 Build the filtered database:
 
     python opensky_build_scientific_db.py build \
-        --database-url postgresql+psycopg://user:pass@host/dbname \
         --download-dir /Volumes/external/opensky
 
 Query the local database with the default join:
 
     python opensky_build_scientific_db.py query \
-        --database-url postgresql+psycopg://user:pass@host/dbname \
         --origin-airport EGLL \
         --minimum-duration-hours 6 \
         --sample-trajectories 25
@@ -68,6 +66,43 @@ Requirements
   - sqlalchemy
 - A PostgreSQL driver compatible with SQLAlchemy, e.g. ``psycopg``
 - A writable local download directory, such as an external drive
+
+Local PostgreSQL setup
+----------------------
+This script assumes a local PostgreSQL database named
+``opensky_scientific`` running on ``localhost`` unless you override the
+database URL.
+
+Recommended macOS setup with Homebrew:
+
+1. Install PostgreSQL:
+
+       brew install postgresql@16
+
+2. Start the local server:
+
+       brew services start postgresql@16
+
+3. Add the PostgreSQL client tools to ``PATH``:
+
+       export PATH="/opt/homebrew/opt/postgresql@16/bin:$PATH"
+
+4. Install the Python driver in the project environment:
+
+       pipenv install psycopg[binary]
+
+5. Create the local project database:
+
+       createdb opensky_scientific
+
+After that, the script's default database URL is usually sufficient:
+
+    postgresql+psycopg://[your-macos-username]@localhost/opensky_scientific
+
+The PostgreSQL server decides where the database files live on disk. With the
+Homebrew setup above, the data directory is typically managed under
+``/opt/homebrew/var/postgresql@16``. The large scientific source downloads are
+separate and should be directed to an external drive with ``--download-dir``.
 
 Testing
 -------
@@ -96,6 +131,7 @@ import argparse
 import csv
 from dataclasses import dataclass
 from datetime import date, timedelta
+import getpass
 import gzip
 import io
 import json
@@ -130,6 +166,17 @@ DEFAULT_HTTP_TIMEOUT_SECONDS = 60.0
 DOWNLOAD_CHUNK_SIZE = 1024 * 1024
 COVID_CHUNK_ROWS = 100_000
 STATE_VECTOR_INSERT_BATCH_SIZE = 5_000
+DEFAULT_DATABASE_NAME = "opensky_scientific"
+
+
+def build_default_database_url() -> str:
+    return (
+        f"postgresql+psycopg://{getpass.getuser()}@localhost/"
+        f"{DEFAULT_DATABASE_NAME}"
+    )
+
+
+DEFAULT_DATABASE_URL = build_default_database_url()
 
 
 @dataclass(frozen=True)
@@ -922,7 +969,14 @@ def build_parser() -> argparse.ArgumentParser:
         "build",
         help="Download filtered source files and build the PostgreSQL database.",
     )
-    build_parser.add_argument("--database-url", required=True)
+    build_parser.add_argument(
+        "--database-url",
+        default=DEFAULT_DATABASE_URL,
+        help=(
+            "SQLAlchemy PostgreSQL URL. Default: "
+            f"{DEFAULT_DATABASE_URL}"
+        ),
+    )
     build_parser.add_argument(
         "--download-dir",
         required=True,
@@ -961,7 +1015,14 @@ def build_parser() -> argparse.ArgumentParser:
         "query",
         help="Run the default or a custom SQL query against the scientific DB.",
     )
-    query_parser.add_argument("--database-url", required=True)
+    query_parser.add_argument(
+        "--database-url",
+        default=DEFAULT_DATABASE_URL,
+        help=(
+            "SQLAlchemy PostgreSQL URL. Default: "
+            f"{DEFAULT_DATABASE_URL}"
+        ),
+    )
     query_parser.add_argument(
         "--origin-airport",
         default=DEFAULT_ORIGIN_AIRPORTS[0],
