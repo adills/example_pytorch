@@ -137,7 +137,10 @@ from torch.nn import functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
 
-DATA_PATH = Path(__file__).with_name("long_distance_trajectories.csv")
+BASE_DIR = Path(__file__).parent
+DATA_DIR = BASE_DIR / "gan_data"
+RESULTS_DIR = BASE_DIR / "gan_results"
+DATA_PATH = DATA_DIR / "long_distance_trajectories.csv"
 FEATURE_NAMES = (
     "lat",
     "lon",
@@ -221,6 +224,10 @@ def build_normalized_time_channel(
     return time_steps.view(1, sequence_length, 1).expand(batch_size, -1, -1)
 
 
+def ensure_parent_dir(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Train a PyTorch GAN to synthesize aircraft time series."
@@ -300,37 +307,37 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--plot-path",
         type=Path,
-        default=Path("gan_timeseries_sequences.png"),
+        default=RESULTS_DIR / "gan_timeseries_sequences.png",
         help="Optional output path for the qualitative comparison plot.",
     )
     parser.add_argument(
         "--trajectory-overlay-plot-path",
         type=Path,
-        default=Path("gan_timeseries_trajectory_overlay.png"),
+        default=RESULTS_DIR / "gan_timeseries_trajectory_overlay.png",
         help="Output path for the original-vs-synthetic full trajectory overlay.",
     )
     parser.add_argument(
         "--trajectory-envelope-plot-path",
         type=Path,
-        default=Path("gan_timeseries_trajectory_envelope.png"),
+        default=RESULTS_DIR / "gan_timeseries_trajectory_envelope.png",
         help="Output path for the mean trajectory plus 1-sigma envelope plot.",
     )
     parser.add_argument(
         "--loss-plot-path",
         type=Path,
-        default=Path("gan_timeseries_training_losses.png"),
+        default=RESULTS_DIR / "gan_timeseries_training_losses.png",
         help="Output path for the GAN training loss plot.",
     )
     parser.add_argument(
         "--raw-data-plot-path",
         type=Path,
-        default=Path("gan_timeseries_loaded_altitude.png"),
+        default=RESULTS_DIR / "gan_timeseries_loaded_altitude.png",
         help="Output path for the raw altitude-vs-time verification plot.",
     )
     parser.add_argument(
         "--scaled-data-plot-path",
         type=Path,
-        default=Path("gan_timeseries_scaled_altitude.png"),
+        default=RESULTS_DIR / "gan_timeseries_scaled_altitude.png",
         help="Output path for the scaled altitude-vs-time verification plot.",
     )
     parser.add_argument(
@@ -594,6 +601,7 @@ def format_flight_label(flight_frame: pd.DataFrame) -> str:
 def save_raw_altitude_plot(flight_frames: list[pd.DataFrame], output_path: Path) -> None:
     import matplotlib.pyplot as plt
 
+    ensure_parent_dir(output_path)
     fig, axis = plt.subplots(figsize=(10, 6))
 
     for flight_frame in flight_frames:
@@ -624,6 +632,7 @@ def save_scaled_altitude_plot(
 ) -> None:
     import matplotlib.pyplot as plt
 
+    ensure_parent_dir(output_path)
     altitude_index = FEATURE_NAMES.index("altitude_m")
     altitude_mean = float(stats.mean[altitude_index].detach().cpu().item())
     altitude_std = float(stats.std[altitude_index].detach().cpu().item())
@@ -788,6 +797,7 @@ def save_trajectory_overlay_plot(
 ) -> None:
     import matplotlib.pyplot as plt
 
+    ensure_parent_dir(output_path)
     altitude_index = FEATURE_NAMES.index("altitude_m")
     fig, axis = plt.subplots(figsize=(10, 6))
 
@@ -856,6 +866,7 @@ def save_trajectory_envelope_plot(
 ) -> None:
     import matplotlib.pyplot as plt
 
+    ensure_parent_dir(output_path)
     normalized_axis, real_altitudes = resample_trajectory_feature(
         trajectories=real_trajectories,
         feature_name="altitude_m",
@@ -918,6 +929,7 @@ def save_training_loss_plot(
 ) -> None:
     import matplotlib.pyplot as plt
 
+    ensure_parent_dir(output_path)
     generator_loss = history["generator_loss"]
     discriminator_loss = history["discriminator_loss"]
     overall_loss = [
@@ -1335,6 +1347,7 @@ def save_comparison_plot(
 ) -> None:
     import matplotlib.pyplot as plt
 
+    ensure_parent_dir(output_path)
     altitude_index = FEATURE_NAMES.index("altitude_m")
     real_sample = real_batch[0].detach().cpu()
     synthetic_sample = synthetic_batch[0].detach().cpu()
@@ -1408,6 +1421,9 @@ def main() -> None:
     device = select_device()
     dtype = torch.float32
 
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+
     data_config = DataConfig(
         sequence_length=args.sequence_length,
         stride=args.stride,
@@ -1427,6 +1443,11 @@ def main() -> None:
 
     print(f"Using device: {device}")
     print(f"Reading trajectories from: {args.data_path}")
+    if not args.data_path.exists():
+        raise FileNotFoundError(
+            f"Expected trajectory CSV at {args.data_path}. "
+            "Place the file in gan_data/ or override --data-path."
+        )
 
     frame = load_trajectory_frame(args.data_path)
     grouped_rows = group_rows_by_flight(frame)

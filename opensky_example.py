@@ -162,9 +162,9 @@ import matplotlib.pyplot as plt
 
 
 SCRIPT_DIR = Path(__file__).parent
-DEFAULT_STEP_1_OUTPUT_PATH = SCRIPT_DIR / "long_haul_flights.csv"
-DEFAULT_STEP_2_OUTPUT_PATH = SCRIPT_DIR / "long_distance_trajectories.csv"
-DEFAULT_PLOT_OUTPUT_PATH = SCRIPT_DIR / "flights_altitude_vs_time.png"
+DEFAULT_STEP_1_OUTPUT_PATH = SCRIPT_DIR / "opensky_results" /"long_haul_flights.csv"
+DEFAULT_STEP_2_OUTPUT_PATH = SCRIPT_DIR / "opensky_results" /"long_distance_trajectories.csv"
+DEFAULT_PLOT_OUTPUT_PATH = SCRIPT_DIR / "opensky_results" /"flights_altitude_vs_time.png"
 
 REST_INTERVAL_LIMIT = pd.Timedelta(days=2)
 REST_CHUNK_RETRY_ATTEMPTS = 3
