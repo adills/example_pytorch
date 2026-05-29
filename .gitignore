@@ -1,2 +1,5 @@
 Pipfile.lock
 __pycache__/*.cpython-310.pyc
+*.DS_Store
+gan_data/
+opensky_results/*.csv
