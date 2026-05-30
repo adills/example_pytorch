@@ -194,6 +194,11 @@ from the local database. The query parameters are configurable, and you can
 also modify the query logic in the code if you want to explore different slices of
 the data.
 
+To see the size of the database, run:
+
+    SELECT pg_size_pretty(pg_database_size('opensky_scientific')) AS db_size,
+    pg_database_size('opensky_scientific') AS db_bytes;
+
 To see how many long-haul flights are in scientific_flights regardless of matched state vectors, run:
 
     SELECT origin, COUNT(*) AS filtered_flights
