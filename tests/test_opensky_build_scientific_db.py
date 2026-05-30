@@ -1,4 +1,11 @@
 import unittest
+from unittest.mock import patch
+import csv
+import gzip
+import io
+import tarfile
+import tempfile
+from pathlib import Path
 
 import pandas as pd
 
@@ -106,6 +113,23 @@ class OpenSkyBuildScientificDbTestCase(unittest.TestCase):
         self.assertIn("ORDER BY RANDOM()", sql)
         self.assertEqual(params["sample_trajectories"], 25)
 
+    def test_parse_timestamp_column_supports_datetime_strings(self) -> None:
+        series = pd.Series(
+            [
+                "2020-02-01 10:00:00+00:00",
+                "2020-02-01 16:30:00+00:00",
+            ]
+        )
+
+        parsed = scientific_db.parse_timestamp_column(series)
+
+        self.assertEqual(parsed.iloc[0], pd.Timestamp("2020-02-01 10:00:00", tz="UTC"))
+        self.assertEqual(parsed.iloc[1], pd.Timestamp("2020-02-01 16:30:00", tz="UTC"))
+
+    def test_parse_epoch_timestamp_supports_datetime_strings(self) -> None:
+        parsed = scientific_db.parse_epoch_timestamp("2020-05-25 23:00:00+00:00")
+        self.assertEqual(parsed, pd.Timestamp("2020-05-25 23:00:00", tz="UTC"))
+
     def test_extract_date_from_name_supports_multiple_patterns(self) -> None:
         self.assertEqual(
             scientific_db.extract_date_from_name("states_2020-03-23_00.csv.tar"),
@@ -197,6 +221,24 @@ class OpenSkyBuildScientificDbTestCase(unittest.TestCase):
         self.assertEqual(int(result.iloc[0]["ge_6h"]), 2)
         self.assertEqual(int(result.iloc[1]["ge_6h"]), 1)
 
+    @patch("opensky_build_scientific_db.pd.read_sql_query")
+    def test_summarize_filtered_flights_from_db_aggregates_by_origin(self, mock_read_sql_query) -> None:
+        mock_read_sql_query.return_value = pd.DataFrame(
+            {
+                "origin": ["EGLL", "EGLL", "OMDB", "OTHH"],
+                "duration_hours": [7.0, 9.0, 8.0, 5.0],
+            }
+        )
+
+        result = scientific_db.summarize_filtered_flights_from_db(
+            engine=None,  # mocked out by pd.read_sql_query patch
+            origin_airports=("EGLL", "OMDB", "OTHH"),
+            minimum_duration_hours=6.0,
+        )
+
+        self.assertEqual(list(result["origin"]), ["EGLL", "OMDB"])
+        self.assertEqual(list(result["rows"]), [2, 1])
+
     def test_state_row_to_record_converts_into_database_shape(self) -> None:
         flight = {
             "flight_key": "abc123|TEST123|2020-01-01T00:00:00+00:00",
@@ -238,6 +280,27 @@ class OpenSkyBuildScientificDbTestCase(unittest.TestCase):
         self.assertEqual(record["source_file"], "states_20200101_00.csv.tar")
         self.assertEqual(record["source_member"], "states_20200101_00.csv")
         self.assertEqual(record["hour"], pd.Timestamp("2020-01-01 00:00:00", tz="UTC"))
+
+    def test_iter_csv_members_from_tar_supports_gzipped_csv_members(self) -> None:
+        csv_bytes = b"time,icao24,callsign\n1577836800,abc123,TEST123\n"
+        gzipped_buffer = io.BytesIO()
+        with gzip.GzipFile(fileobj=gzipped_buffer, mode="wb") as gz_file:
+            gz_file.write(csv_bytes)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            archive_path = Path(temp_dir) / "states_test.csv.tar"
+            with tarfile.open(archive_path, "w") as archive:
+                tar_info = tarfile.TarInfo(name="states_test.csv.gz")
+                payload = gzipped_buffer.getvalue()
+                tar_info.size = len(payload)
+                archive.addfile(tar_info, io.BytesIO(payload))
+
+            iterator = scientific_db.iter_csv_members_from_tar(archive_path)
+            member_name, reader = next(iterator)
+            rows = list(reader)
+
+        self.assertEqual(member_name, "states_test.csv.gz")
+        self.assertEqual(rows[0]["icao24"], "abc123")
 
 
 if __name__ == "__main__":

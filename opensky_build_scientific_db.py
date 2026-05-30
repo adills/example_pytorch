@@ -185,6 +185,80 @@ Notes
       --max-covid-files 4 \
       --max-covid-chunks-per-file 2 \
       --top-n-airports 30
+
+Querying the database
+---------------------
+After building the database, you can run the ``query`` command to execute a
+predefined join query that retrieves a sample of flights and their trajectories
+from the local database. The query parameters are configurable, and you can
+also modify the query logic in the code if you want to explore different slices of
+the data.
+
+To see how many long-haul flights are in scientific_flights regardless of matched state vectors, run:
+
+    SELECT origin, COUNT(*) AS filtered_flights
+    FROM scientific_flights
+    GROUP BY origin
+    ORDER BY origin;
+
+To see what days actually exist in your currently ingested trajectory table, run:
+
+    SELECT
+        MIN(time) AS min_state_time,
+        MAX(time) AS max_state_time,
+        COUNT(*) AS state_rows
+    FROM scientific_state_vectors;
+
+To confirm which hourly archives were ingested, run:
+
+    SELECT source_file, rows_inserted
+    FROM scientific_ingest_manifest
+    WHERE source_dataset = 'weekly_state_vectors'
+    ORDER BY source_file;
+
+To see that the max and min start flight times are for each origin that satisfy
+the join conditions, run:
+
+    SELECT
+        f.origin,
+        MIN(f.firstseen) AS min_start_time,
+        MAX(f.firstseen) AS max_start_time,
+        MAX(f.lastseen) AS max_end_time,
+        COUNT(*) AS matched_flights
+    FROM scientific_flights f
+    JOIN (
+        SELECT DISTINCT flight_key
+        FROM scientific_state_vectors
+    ) sv
+        ON sv.flight_key = f.flight_key
+    GROUP BY f.origin
+    ORDER BY f.origin;
+
+To see how many state vectors are matched to each origin, run:
+
+    SELECT
+        f.origin,
+        COUNT(*) AS state_vector_rows,
+        COUNT(DISTINCT f.flight_key) AS matched_flights
+    FROM scientific_state_vectors sv
+    JOIN scientific_flights f
+        ON sv.flight_key = f.flight_key
+    GROUP BY f.origin
+    ORDER BY f.origin;
+
+To see the average trajectory length in hours for matched flights from each 
+origin, run:
+
+    SELECT
+        f.origin,
+        COUNT(*) AS state_vector_rows,
+        COUNT(DISTINCT f.flight_key) AS matched_flights,
+        ROUND(COUNT(*)::numeric / COUNT(DISTINCT f.flight_key), 2) AS avg_rows_per_flight
+    FROM scientific_state_vectors sv
+    JOIN scientific_flights f
+        ON sv.flight_key = f.flight_key
+    GROUP BY f.origin
+    ORDER BY f.origin;
 """
 
 from __future__ import annotations
@@ -194,6 +268,7 @@ import csv
 from dataclasses import dataclass
 from datetime import date, timedelta
 import getpass
+import gzip
 import io
 from pathlib import Path
 import re
@@ -525,9 +600,14 @@ def fetch_state_archive_metadata(
     for key in keys:
         if not key.endswith(suffixes):
             continue
+        if "/." in key:
+            continue
+        archive_name = Path(key).name
+        if archive_name.startswith("states_."):
+            continue
         files.append(
             {
-                "name": Path(key).name,
+                "name": archive_name,
                 "url": urljoin(STATES_BUCKET_LIST_URL, key),
             }
         )
@@ -645,6 +725,7 @@ def mark_manifest_completed(
     source_file: str,
     source_url: str,
     rows_inserted: int,
+    error_message: str | None = None,
 ) -> None:
     statement = text(
         """
@@ -666,7 +747,7 @@ def mark_manifest_completed(
             :rows_inserted,
             NOW(),
             NOW(),
-            NULL
+            :error_message
         )
         ON CONFLICT (source_dataset, source_file)
         DO UPDATE SET
@@ -674,7 +755,7 @@ def mark_manifest_completed(
             status = EXCLUDED.status,
             rows_inserted = EXCLUDED.rows_inserted,
             completed_at = NOW(),
-            error_message = NULL
+            error_message = EXCLUDED.error_message
         """
     )
     with engine.begin() as connection:
@@ -686,6 +767,7 @@ def mark_manifest_completed(
                 "source_url": source_url,
                 "status": MANIFEST_STATUS_COMPLETED,
                 "rows_inserted": rows_inserted,
+                "error_message": error_message,
             },
         )
 
@@ -743,7 +825,38 @@ def mark_manifest_failed(
 
 def parse_timestamp_column(series: pd.Series) -> pd.Series:
     numeric_series = pd.to_numeric(series, errors="coerce")
-    return pd.to_datetime(numeric_series, unit="s", utc=True)
+    parsed = pd.Series(pd.NaT, index=series.index, dtype="datetime64[ns, UTC]")
+
+    numeric_mask = numeric_series.notna()
+    if numeric_mask.any():
+        numeric_values = numeric_series[numeric_mask]
+        millisecond_mask = numeric_values.abs().ge(1e11)
+        second_values = numeric_values[~millisecond_mask]
+        millisecond_values = numeric_values[millisecond_mask]
+        if not second_values.empty:
+            parsed.loc[second_values.index] = pd.to_datetime(
+                second_values,
+                unit="s",
+                utc=True,
+                errors="coerce",
+            )
+        if not millisecond_values.empty:
+            parsed.loc[millisecond_values.index] = pd.to_datetime(
+                millisecond_values,
+                unit="ms",
+                utc=True,
+                errors="coerce",
+            )
+
+    non_numeric_mask = ~numeric_mask
+    if non_numeric_mask.any():
+        parsed.loc[non_numeric_mask] = pd.to_datetime(
+            series[non_numeric_mask],
+            utc=True,
+            errors="coerce",
+        )
+
+    return parsed
 
 
 def validate_required_columns(
@@ -1064,6 +1177,8 @@ def inspect_covid_data(config: InspectCovidConfig) -> None:
     aggregated_frames: list[pd.DataFrame] = []
     inspected_file_names: list[str] = []
     first_columns: list[str] | None = None
+    first_firstseen_samples: list[Any] | None = None
+    first_lastseen_samples: list[Any] | None = None
 
     for file_metadata in progress(
         selected_files,
@@ -1086,6 +1201,8 @@ def inspect_covid_data(config: InspectCovidConfig) -> None:
                 )
                 if first_columns is None:
                     first_columns = list(chunk.columns)
+                    first_firstseen_samples = chunk["firstseen"].head(5).tolist()
+                    first_lastseen_samples = chunk["lastseen"].head(5).tolist()
                 aggregated_frames.append(summarize_unfiltered_covid_chunk(chunk))
                 chunk_count += 1
                 if chunk_count >= config.max_covid_chunks_per_file:
@@ -1105,6 +1222,14 @@ def inspect_covid_data(config: InspectCovidConfig) -> None:
     print(f"Rows inspected: {len(combined)}")
     if first_columns is not None:
         print(f"Columns: {first_columns}")
+    if first_firstseen_samples is not None and first_lastseen_samples is not None:
+        print(f"Sample raw firstseen values: {first_firstseen_samples}")
+        print(f"Sample raw lastseen values: {first_lastseen_samples}")
+    print(
+        "Parsed timestamp null counts: "
+        f"firstseen={int(combined['firstseen'].isna().sum())}, "
+        f"lastseen={int(combined['lastseen'].isna().sum())}"
+    )
 
     print("\nTop origin airports by rows:")
     origin_counts = (
@@ -1133,6 +1258,8 @@ def inspect_covid_data(config: InspectCovidConfig) -> None:
         print(duration_quantiles.to_string())
         print("\nDuration bucket counts:")
         print(format_duration_bucket_summary(combined))
+    else:
+        print("\nNo valid duration values were parsed from the inspected rows.")
 
     print("\nTop origins by long-haul counts:")
     origin_duration_summary = build_origin_duration_summary(
@@ -1201,6 +1328,38 @@ def load_candidate_archive_hours_from_db(
     return candidate_hours
 
 
+def summarize_filtered_flights_from_db(
+    engine: Engine,
+    origin_airports: Sequence[str],
+    minimum_duration_hours: float,
+) -> pd.DataFrame:
+    flights_df = pd.read_sql_query(
+        text(
+            """
+            SELECT origin, duration_hours
+            FROM scientific_flights
+            """
+        ),
+        engine,
+    )
+    flights_df = flights_df[
+        flights_df["origin"].isin(origin_airports)
+        & flights_df["duration_hours"].ge(minimum_duration_hours)
+    ].copy()
+    if flights_df.empty:
+        return pd.DataFrame(columns=["origin", "rows", "mean_duration_hours", "max_duration_hours"])
+
+    summary = (
+        flights_df.groupby("origin", dropna=True)["duration_hours"]
+        .agg(rows="size", mean_duration_hours="mean", max_duration_hours="max")
+        .reset_index()
+        .sort_values(["rows", "mean_duration_hours"], ascending=False)
+    )
+    summary["mean_duration_hours"] = summary["mean_duration_hours"].round(2)
+    summary["max_duration_hours"] = summary["max_duration_hours"].round(2)
+    return summary
+
+
 def load_flights_for_day(engine: Engine, day: date) -> list[dict[str, Any]]:
     day_start = pd.Timestamp(day, tz="UTC")
     day_end = day_start + pd.Timedelta(days=1)
@@ -1266,10 +1425,25 @@ def parse_optional_bool(value: str | None) -> bool | None:
 
 
 def parse_epoch_timestamp(value: str | None) -> pd.Timestamp | None:
-    numeric_value = parse_optional_float(value)
-    if numeric_value is None:
+    if value is None or value == "":
         return None
-    return pd.Timestamp(numeric_value, unit="s", tz="UTC")
+
+    numeric_value = parse_optional_float(value)
+    if numeric_value is not None:
+        unit = "ms" if abs(numeric_value) >= 1e11 else "s"
+        try:
+            return pd.Timestamp(numeric_value, unit=unit, tz="UTC")
+        except Exception:
+            return None
+
+    try:
+        parsed = pd.Timestamp(value)
+    except Exception:
+        return None
+
+    if parsed.tzinfo is None:
+        return parsed.tz_localize("UTC")
+    return parsed.tz_convert("UTC")
 
 
 def match_state_row_to_flight(
@@ -1349,12 +1523,20 @@ def iter_csv_members_from_tar(archive_path: Path) -> Iterator[tuple[str, csv.Dic
     mode = "r:*"
     with tarfile.open(archive_path, mode) as archive:
         for member in archive.getmembers():
-            if not member.isfile() or not member.name.endswith(".csv"):
+            if not member.isfile():
+                continue
+            is_plain_csv = member.name.endswith(".csv")
+            is_gzipped_csv = member.name.endswith(".csv.gz")
+            if not is_plain_csv and not is_gzipped_csv:
                 continue
             extracted = archive.extractfile(member)
             if extracted is None:
                 continue
-            text_stream = io.TextIOWrapper(extracted, encoding="utf-8")
+            if is_gzipped_csv:
+                gzip_stream = gzip.GzipFile(fileobj=extracted)
+                text_stream = io.TextIOWrapper(gzip_stream, encoding="utf-8")
+            else:
+                text_stream = io.TextIOWrapper(extracted, encoding="utf-8")
             reader = csv.DictReader(text_stream)
             yield member.name, reader
 
@@ -1387,6 +1569,7 @@ def process_state_archive_streaming(
     )
     temp_path: Path | None = None
     total_inserted = 0
+    diagnostic_summary_text: str | None = None
     try:
         temp_path = download_to_temporary_file(source_url, workspace_dir, source_file)
         print(f"Processing state archive: {source_file}")
@@ -1399,6 +1582,7 @@ def process_state_archive_streaming(
                 source_file=source_file,
                 source_url=source_url,
                 rows_inserted=0,
+                error_message=f"No eligible flights found for archive day: {archive_day}",
             )
             return 0
 
@@ -1419,14 +1603,41 @@ def process_state_archive_streaming(
                     "State first-file schema check passed. Columns: "
                     f"{fieldnames}"
                 )
-                first_member = False
+                diagnostic_sample_times: list[str | None] = []
+                diagnostic_sample_icao24: list[str | None] = []
+                diagnostic_sample_callsigns: list[str | None] = []
+                diagnostic_rows_with_time = 0
+                diagnostic_rows_with_candidate_icao24 = 0
+                diagnostic_rows_with_time_overlap = 0
+                diagnostic_rows_matched = 0
             row_counter = 0
             match_counter = 0
             for row in reader:
                 row_counter += 1
+                if validate_schema and first_member:
+                    if len(diagnostic_sample_times) < 5:
+                        diagnostic_sample_times.append(row.get("time"))
+                        diagnostic_sample_icao24.append(row.get("icao24"))
+                        diagnostic_sample_callsigns.append(row.get("callsign"))
+                    row_icao24 = (row.get("icao24") or "").strip().lower()
+                    row_time = parse_epoch_timestamp(row.get("time"))
+                    if row_time is not None:
+                        diagnostic_rows_with_time += 1
+                    if row_icao24 and row_icao24 in flights_by_icao24:
+                        diagnostic_rows_with_candidate_icao24 += 1
+                        if row_time is not None:
+                            overlap_candidates = [
+                                flight
+                                for flight in flights_by_icao24[row_icao24]
+                                if pd.Timestamp(flight["firstseen"]) <= row_time <= pd.Timestamp(flight["lastseen"])
+                            ]
+                            if overlap_candidates:
+                                diagnostic_rows_with_time_overlap += 1
                 matched_flight = match_state_row_to_flight(row, flights_by_icao24)
                 if matched_flight is None:
                     continue
+                if validate_schema and first_member:
+                    diagnostic_rows_matched += 1
                 buffered_records.append(
                     state_row_to_record(
                         row,
@@ -1454,6 +1665,26 @@ def process_state_archive_streaming(
                 f"Finished member {member_name}: processed {row_counter} rows, "
                 f"matched {match_counter} rows."
             )
+            if validate_schema and first_member:
+                diagnostic_summary_text = (
+                    "sample_times="
+                    f"{diagnostic_sample_times}, "
+                    "sample_icao24="
+                    f"{diagnostic_sample_icao24}, "
+                    "sample_callsigns="
+                    f"{diagnostic_sample_callsigns}, "
+                    "rows_with_parseable_time="
+                    f"{diagnostic_rows_with_time}, "
+                    "rows_with_candidate_icao24="
+                    f"{diagnostic_rows_with_candidate_icao24}, "
+                    "rows_with_time_overlap="
+                    f"{diagnostic_rows_with_time_overlap}, "
+                    "rows_matched="
+                    f"{diagnostic_rows_matched}"
+                )
+                print("State first-member diagnostic summary:")
+                print(diagnostic_summary_text)
+                first_member = False
 
         if buffered_records:
             total_inserted += insert_records(
@@ -1463,12 +1694,23 @@ def process_state_archive_streaming(
                 conflict_columns=["flight_key", "time", "icao24", "callsign"],
             )
 
+        if total_inserted == 0 and diagnostic_summary_text is not None:
+            print(
+                "No matching state-vector rows were inserted for "
+                f"{source_file}. First-member diagnostics: {diagnostic_summary_text}"
+            )
+
         mark_manifest_completed(
             engine,
             source_dataset="weekly_state_vectors",
             source_file=source_file,
             source_url=source_url,
             rows_inserted=total_inserted,
+            error_message=(
+                f"No matched state rows. Diagnostics: {diagnostic_summary_text}"
+                if total_inserted == 0 and diagnostic_summary_text is not None
+                else None
+            ),
         )
         return total_inserted
     except Exception as exc:
@@ -1651,6 +1893,16 @@ def build_scientific_db(config: BuildConfig) -> None:
         minimum_duration_hours=config.minimum_duration_hours,
     )
     print(f"Inserted or refreshed {inserted_flights} filtered flight rows from streaming ingest.")
+    filtered_flight_summary = summarize_filtered_flights_from_db(
+        engine,
+        origin_airports=config.origin_airports,
+        minimum_duration_hours=config.minimum_duration_hours,
+    )
+    if filtered_flight_summary.empty:
+        print("Filtered flight summary is empty after Step 1.")
+    else:
+        print("\n--- Filtered Flight Summary ---")
+        print(filtered_flight_summary.to_string(index=False))
 
     candidate_days = load_candidate_days_from_db(
         engine,

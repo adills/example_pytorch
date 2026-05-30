@@ -2,7 +2,8 @@
 OpenSky long-haul flight and trajectory example.
 
 This script demonstrates a two-step workflow for retrieving long-haul flights
-from OpenSky and then building a trajectory dataset for those flights.
+from OpenSky or a local scientific PostgreSQL database and then building a
+trajectory dataset for those flights.
 
 Workflow
 --------
@@ -21,11 +22,18 @@ Step 2:
 
 Backends
 --------
-The script supports two OpenSky backends:
+The script supports four backend modes:
+
+- ``auto``:
+  Prefer the local scientific PostgreSQL database when it is available. If the
+  scientific DB is not available, fall back to Trino.
+
+- ``scientific_db``:
+  Use the local PostgreSQL database built by ``opensky_build_scientific_db.py``.
+  This is the preferred option when that database has already been built.
 
 - ``trino``:
-  Uses the OpenSky Trino historical database. This is the default backend and
-  the preferred option for larger historical pulls.
+  Uses the OpenSky Trino historical database.
 
 - ``rest``:
   Uses the OpenSky REST API. This path supports chunking, retry handling, and
@@ -38,8 +46,8 @@ The main user-facing options are:
 - ``--step 1|2|both``
   Select which workflow step to run.
 
-- ``--backend rest|trino``
-  Select the OpenSky data backend. Default: ``trino``.
+- ``--backend auto|scientific_db|rest|trino``
+  Select the data backend. Default: ``auto``.
 
 - ``--origin-airport ICAO``
   Origin airport ICAO identifier. Default: ``EGLL``.
@@ -55,6 +63,14 @@ The main user-facing options are:
 
 Example commands
 ----------------
+Run Step 1 with the default auto backend:
+
+    python opensky_example.py --step 1
+
+Run Step 1 with the local scientific DB:
+
+    python opensky_example.py --step 1 --backend scientific_db
+
 Run Step 1 with Trino:
 
     python opensky_example.py --step 1 --backend trino
@@ -81,6 +97,11 @@ Python dependencies:
 - httpx
 
 Backend-specific requirements:
+
+- Scientific DB backend:
+  Build the local PostgreSQL dataset first with ``opensky_build_scientific_db.py``.
+  The default database URL matches the local setup created by
+  ``opensky_create_postgresql_db.sh``.
 
 - REST backend:
   Configure OpenSky REST credentials if you want authenticated access.
@@ -137,11 +158,16 @@ from typing import Any, Literal
 import httpx
 import matplotlib
 import pandas as pd
+from opensky_build_scientific_db import DEFAULT_DATABASE_URL
+from opensky_build_scientific_db import get_engine
+from opensky_build_scientific_db import query_scientific_db
 from pyopensky.rest import REST
 from pyopensky.trino import Trino
+from sqlalchemy import text
 
 
-BackendName = Literal["rest", "trino"]
+BackendName = Literal["auto", "scientific_db", "rest", "trino"]
+ResolvedBackendName = Literal["scientific_db", "rest", "trino"]
 StepName = Literal["1", "2", "both"]
 
 
@@ -174,8 +200,9 @@ REST_TRACK_RETRY_SLEEP_SECONDS = 2
 REST_TRACK_MAX_RETRY_AFTER_SECONDS = 30
 TRACK_REQUEST_COOLDOWN_SECONDS = 5
 STEP_2_DEFAULT_RETRY_WAIT_SECONDS = 3600
+SCIENTIFIC_DB_STEP_2_BATCH_SIZE = 500
 
-DEFAULT_BACKEND: BackendName = "trino"
+DEFAULT_BACKEND: BackendName = "auto"
 DEFAULT_STEP: StepName = "1"
 DEFAULT_ORIGIN_AIRPORT = "EGLL"  # London Heathrow
 DEFAULT_START_TIME = "2026-01-24 00:00:00"
@@ -222,13 +249,19 @@ class OutputPaths:
 
 @dataclass(frozen=True)
 class RunConfig:
-    backend: BackendName
+    backend: ResolvedBackendName
     step: StepName
     origin_airport: str
     start_time: str
     end_time: str
     minimum_duration_hours: float
+    database_url: str
     paths: OutputPaths
+
+
+@dataclass(frozen=True)
+class ScientificDbClient:
+    database_url: str
 
 
 class Step2RateLimitError(RuntimeError):
@@ -247,7 +280,12 @@ def build_flight_key(
     return f"{icao24}|{callsign_clean}|{first_seen_ts.isoformat()}"
 
 
-def make_backend_client(backend: BackendName) -> REST | Trino:
+def make_backend_client(
+    backend: ResolvedBackendName,
+    database_url: str,
+) -> REST | Trino | ScientificDbClient:
+    if backend == "scientific_db":
+        return ScientificDbClient(database_url=database_url)
     if backend == "rest":
         return REST()
     return Trino()
@@ -261,6 +299,7 @@ def build_run_config(args: argparse.Namespace) -> RunConfig:
         start_time=args.start_time,
         end_time=args.end_time,
         minimum_duration_hours=args.minimum_duration_hours,
+        database_url=args.database_url,
         paths=OutputPaths(),
     )
 
@@ -280,9 +319,20 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--backend",
-        choices=["rest", "trino"],
+        choices=["auto", "scientific_db", "rest", "trino"],
         default=DEFAULT_BACKEND,
-        help="Data backend to use. Trino is the default for bulk history.",
+        help=(
+            "Data backend to use. 'auto' prefers the local scientific DB and "
+            "falls back to Trino."
+        ),
+    )
+    parser.add_argument(
+        "--database-url",
+        default=DEFAULT_DATABASE_URL,
+        help=(
+            "SQLAlchemy database URL for the local scientific DB backend. "
+            f"Default: {DEFAULT_DATABASE_URL}"
+        ),
     )
     parser.add_argument(
         "--origin-airport",
@@ -306,6 +356,55 @@ def parse_args() -> argparse.Namespace:
         help="Minimum duration in hours for a flight to count as long-haul.",
     )
     return parser.parse_args()
+
+
+def scientific_db_is_available(
+    database_url: str,
+    step: StepName,
+) -> bool:
+    try:
+        engine = get_engine(database_url)
+        with engine.connect() as connection:
+            status_row = connection.execute(
+                text(
+                    """
+                    SELECT
+                        to_regclass('public.scientific_flights') AS flights_table,
+                        to_regclass('public.scientific_state_vectors') AS states_table
+                    """
+                )
+            ).mappings().one()
+    except Exception:
+        return False
+
+    if status_row["flights_table"] is None:
+        return False
+    if step in {"2", "both"} and status_row["states_table"] is None:
+        return False
+    return True
+
+
+def resolve_backend(
+    requested_backend: BackendName,
+    *,
+    database_url: str,
+    step: StepName,
+) -> ResolvedBackendName:
+    if requested_backend != "auto":
+        return requested_backend
+
+    if scientific_db_is_available(database_url, step):
+        print(
+            "Using local scientific PostgreSQL database backend at "
+            f"{database_url}."
+        )
+        return "scientific_db"
+
+    print(
+        "Local scientific PostgreSQL database not available. "
+        "Falling back to Trino."
+    )
+    return "trino"
 
 
 def plot_altitude_vs_time_since_takeoff(
@@ -578,6 +677,48 @@ def fetch_flights_step_1_trino(
     return normalized_df.assign(source_backend="trino")
 
 
+def fetch_flights_step_1_scientific_db(
+    config: RunConfig,
+    client: ScientificDbClient,
+) -> pd.DataFrame:
+    sql = """
+    SELECT
+        icao24,
+        callsign,
+        origin AS "estDepartureAirport",
+        destination AS "estArrivalAirport",
+        firstseen AS "firstSeen",
+        lastseen AS "lastSeen",
+        duration_hours,
+        flight_key,
+        'scientific_db' AS source_backend
+    FROM scientific_flights
+    WHERE origin = :origin_airport
+      AND duration_hours >= :minimum_duration_hours
+      AND firstseen >= :start_time
+      AND lastseen <= :end_time
+      AND destination IS NOT NULL
+    ORDER BY firstseen
+    """
+    flights_df = pd.read_sql_query(
+        text(sql),
+        get_engine(client.database_url),
+        params={
+            "origin_airport": config.origin_airport,
+            "minimum_duration_hours": config.minimum_duration_hours,
+            "start_time": config.start_time,
+            "end_time": config.end_time,
+        },
+    )
+    if flights_df.empty:
+        return flights_df
+
+    flights_df["firstSeen"] = pd.to_datetime(flights_df["firstSeen"], utc=True)
+    flights_df["lastSeen"] = pd.to_datetime(flights_df["lastSeen"], utc=True)
+    flights_df["callsign"] = flights_df["callsign"].astype(str).str.strip()
+    return flights_df
+
+
 def prepare_long_haul_flights(
     flights_df: pd.DataFrame,
     minimum_duration_hours: float,
@@ -628,6 +769,62 @@ def load_step_1_results(step_1_output_path: Path) -> pd.DataFrame:
     return pd.read_csv(
         step_1_output_path,
         parse_dates=["firstSeen", "lastSeen"],
+    )
+
+
+def fetch_track_batch_scientific_db(
+    database_url: str,
+    flight_keys: list[str],
+) -> pd.DataFrame:
+    if not flight_keys:
+        return pd.DataFrame(columns=STEP_2_SCHEMA_COLUMNS)
+
+    placeholders = []
+    sql_params: dict[str, Any] = {}
+    for index, flight_key in enumerate(flight_keys):
+        parameter_name = f"flight_key_{index}"
+        placeholders.append(f":{parameter_name}")
+        sql_params[parameter_name] = flight_key
+
+    sql_query = f"""
+    SELECT
+        sv.time,
+        sv.icao24,
+        sv.lat,
+        sv.lon,
+        sv.velocity,
+        sv.heading,
+        sv.vertrate,
+        sv.callsign,
+        sv.onground,
+        sv.alert,
+        sv.spi,
+        sv.squawk,
+        sv.baroaltitude,
+        sv.geoaltitude,
+        sv.lastposupdate,
+        sv.lastcontact,
+        sv.serials,
+        sv.hour,
+        sv.flight_key,
+        f.origin,
+        f.destination,
+        f.firstseen AS first_seen,
+        f.lastseen AS last_seen,
+        f.duration_hours,
+        'scientific_db' AS source_backend
+    FROM scientific_state_vectors sv
+    JOIN scientific_flights f
+      ON sv.flight_key = f.flight_key
+    WHERE sv.flight_key IN ({", ".join(placeholders)})
+    ORDER BY f.firstseen, sv.time
+    """
+    return standardize_step_2_schema(
+        query_scientific_db(
+            database_url,
+            sql_query=sql_query,
+            sql_params=sql_params,
+        )
     )
 
 
@@ -916,6 +1113,52 @@ def run_step_1_trino(
     save_step_1_results(long_haul_flights, config.paths.step_1_output_path)
 
 
+def run_step_1_scientific_db(
+    config: RunConfig,
+    client: ScientificDbClient,
+) -> None:
+    print(
+        f"--- Step 1 ({config.backend}): Loading long-haul flights from "
+        f"local scientific DB for {config.origin_airport} ---"
+    )
+    try:
+        long_haul_flights = fetch_flights_step_1_scientific_db(config, client)
+    except Exception as exc:
+        raise RuntimeError(
+            "Scientific DB Step 1 failed. Check that the local PostgreSQL "
+            "database exists, is reachable, and has been built with "
+            "opensky_build_scientific_db.py."
+        ) from exc
+
+    if long_haul_flights.empty:
+        print(
+            "No flights returned by the local scientific DB for that airport "
+            "and time window."
+        )
+        raise SystemExit(0)
+
+    print(
+        f"Found {len(long_haul_flights)} flights with duration >= "
+        f"{config.minimum_duration_hours} hours and a known arrival airport."
+    )
+    print(
+        long_haul_flights[
+            [
+                "callsign",
+                "icao24",
+                "estDepartureAirport",
+                "estArrivalAirport",
+                "firstSeen",
+                "lastSeen",
+                "duration_hours",
+                "flight_key",
+                "source_backend",
+            ]
+        ].head()
+    )
+    save_step_1_results(long_haul_flights, config.paths.step_1_output_path)
+
+
 def run_step_2_rest(
     config: RunConfig,
     client: REST,
@@ -1052,10 +1295,83 @@ def run_step_2_trino(
     print_step_2_summary(final_trajectory_df, config, stopped_early=False)
 
 
+def run_step_2_scientific_db(
+    config: RunConfig,
+    client: ScientificDbClient,
+) -> None:
+    print(
+        "\n--- Step 2 (scientific_db): Loading trajectories from saved Step 1 "
+        "results via local PostgreSQL ---"
+    )
+
+    long_haul_flights = load_step_1_results(config.paths.step_1_output_path)
+    completed_flight_keys = load_completed_flight_keys(
+        config.paths.step_2_output_path
+    )
+    pending_flights = long_haul_flights[
+        ~long_haul_flights["flight_key"].astype(str).isin(completed_flight_keys)
+    ].copy()
+
+    print(
+        f"Loaded {len(long_haul_flights)} saved flights. "
+        f"{len(completed_flight_keys)} already have trajectory rows. "
+        f"{len(pending_flights)} remain."
+    )
+
+    if pending_flights.empty:
+        final_trajectory_df = load_step_2_results(config.paths.step_2_output_path)
+        print_step_2_summary(final_trajectory_df, config, stopped_early=False)
+        return
+
+    pending_keys = pending_flights["flight_key"].astype(str).tolist()
+    total_batches = (
+        len(pending_keys) + SCIENTIFIC_DB_STEP_2_BATCH_SIZE - 1
+    ) // SCIENTIFIC_DB_STEP_2_BATCH_SIZE
+
+    total_rows_saved = 0
+    for batch_index, start in enumerate(
+        range(0, len(pending_keys), SCIENTIFIC_DB_STEP_2_BATCH_SIZE),
+        start=1,
+    ):
+        batch_keys = pending_keys[start : start + SCIENTIFIC_DB_STEP_2_BATCH_SIZE]
+        print(
+            f"[{batch_index}/{total_batches}] Loading trajectories for "
+            f"{len(batch_keys)} flights from local scientific DB..."
+        )
+        try:
+            track_df = fetch_track_batch_scientific_db(
+                client.database_url,
+                batch_keys,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "Scientific DB Step 2 failed. Check that the local PostgreSQL "
+                "database exists, is reachable, and contains trajectory rows."
+            ) from exc
+
+        if track_df.empty:
+            continue
+
+        append_tracks_to_output(track_df, config.paths.step_2_output_path)
+        total_rows_saved += len(track_df)
+        print(
+            f"Saved {len(track_df)} trajectory rows for batch {batch_index} "
+            f"to {config.paths.step_2_output_path}"
+        )
+
+    print(f"Saved {total_rows_saved} total trajectory rows from local scientific DB.")
+    final_trajectory_df = load_step_2_results(config.paths.step_2_output_path)
+    print_step_2_summary(final_trajectory_df, config, stopped_early=False)
+
+
 def run_step_1(
     config: RunConfig,
-    client: REST | Trino,
+    client: REST | Trino | ScientificDbClient,
 ) -> None:
+    if config.backend == "scientific_db":
+        assert isinstance(client, ScientificDbClient)
+        run_step_1_scientific_db(config, client)
+        return
     if config.backend == "rest":
         assert isinstance(client, REST)
         run_step_1_rest(config, client)
@@ -1067,8 +1383,12 @@ def run_step_1(
 
 def run_step_2(
     config: RunConfig,
-    client: REST | Trino,
+    client: REST | Trino | ScientificDbClient,
 ) -> None:
+    if config.backend == "scientific_db":
+        assert isinstance(client, ScientificDbClient)
+        run_step_2_scientific_db(config, client)
+        return
     if config.backend == "rest":
         assert isinstance(client, REST)
         run_step_2_rest(config, client)
@@ -1080,8 +1400,14 @@ def run_step_2(
 
 def main() -> None:
     args = parse_args()
+    resolved_backend = resolve_backend(
+        args.backend,
+        database_url=args.database_url,
+        step=args.step,
+    )
+    args.backend = resolved_backend
     config = build_run_config(args)
-    client = make_backend_client(config.backend)
+    client = make_backend_client(config.backend, config.database_url)
 
     if config.step in {"1", "both"}:
         run_step_1(config, client)
