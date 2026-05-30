@@ -279,6 +279,7 @@ from pathlib import Path
 import re
 import tarfile
 import tempfile
+import time
 from typing import Any, Iterable, Iterator, Sequence
 from urllib.parse import urljoin
 import xml.etree.ElementTree as ET
@@ -304,6 +305,9 @@ DEFAULT_MINIMUM_DURATION_HOURS = 6.0
 DEFAULT_STATE_ARCHIVE_FORMAT = "csv"
 DEFAULT_HTTP_TIMEOUT_SECONDS = 60.0
 DOWNLOAD_CHUNK_SIZE = 1024 * 1024
+DOWNLOAD_RETRY_ATTEMPTS = 4
+DOWNLOAD_RETRY_SLEEP_SECONDS = 5
+RETRIABLE_DOWNLOAD_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
 COVID_CHUNK_ROWS = 100_000
 STATE_VECTOR_INSERT_BATCH_SIZE = 5_000
 DEFAULT_DATABASE_NAME = "opensky_scientific"
@@ -624,28 +628,59 @@ def ensure_workspace(download_dir: Path) -> Path:
     return download_dir
 
 
+def is_retriable_download_exception(exc: Exception) -> bool:
+    if isinstance(exc, (httpx.TimeoutException, httpx.NetworkError, httpx.RequestError)):
+        return True
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code in RETRIABLE_DOWNLOAD_STATUS_CODES
+    return False
+
+
 def download_to_temporary_file(url: str, workspace_dir: Path, filename: str) -> Path:
     ensure_workspace(workspace_dir)
     suffix = "".join(Path(filename).suffixes) or ".tmp"
-    with tempfile.NamedTemporaryFile(
-        mode="wb",
-        suffix=suffix,
-        prefix="opensky_",
-        dir=workspace_dir,
-        delete=False,
-    ) as handle:
-        temp_path = Path(handle.name)
-        print(f"Streaming {url} -> temporary file {temp_path}")
-        with httpx.Client(
-            timeout=DEFAULT_HTTP_TIMEOUT_SECONDS,
-            follow_redirects=True,
-        ) as client:
-            with client.stream("GET", url) as response:
-                response.raise_for_status()
-                for chunk in response.iter_bytes(chunk_size=DOWNLOAD_CHUNK_SIZE):
-                    if chunk:
-                        handle.write(chunk)
-    return temp_path
+    for attempt in range(1, DOWNLOAD_RETRY_ATTEMPTS + 1):
+        temp_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="wb",
+                suffix=suffix,
+                prefix="opensky_",
+                dir=workspace_dir,
+                delete=False,
+            ) as handle:
+                temp_path = Path(handle.name)
+                print(f"Streaming {url} -> temporary file {temp_path}")
+                with httpx.Client(
+                    timeout=DEFAULT_HTTP_TIMEOUT_SECONDS,
+                    follow_redirects=True,
+                ) as client:
+                    with client.stream("GET", url) as response:
+                        response.raise_for_status()
+                        for chunk in response.iter_bytes(chunk_size=DOWNLOAD_CHUNK_SIZE):
+                            if chunk:
+                                handle.write(chunk)
+            return temp_path
+        except Exception as exc:
+            if temp_path is not None and temp_path.exists():
+                temp_path.unlink(missing_ok=True)
+
+            if not is_retriable_download_exception(exc) or attempt == DOWNLOAD_RETRY_ATTEMPTS:
+                raise
+
+            sleep_seconds = DOWNLOAD_RETRY_SLEEP_SECONDS * attempt
+            if isinstance(exc, httpx.HTTPStatusError):
+                error_detail = f"HTTP {exc.response.status_code}"
+            else:
+                error_detail = exc.__class__.__name__
+            print(
+                f"Download failed for {filename} with {error_detail}. "
+                f"Sleeping {sleep_seconds}s before retry "
+                f"{attempt + 1}/{DOWNLOAD_RETRY_ATTEMPTS}."
+            )
+            time.sleep(sleep_seconds)
+
+    raise RuntimeError(f"Download unexpectedly exhausted retries for {filename}")
 
 
 def get_manifest_status(

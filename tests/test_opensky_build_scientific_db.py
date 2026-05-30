@@ -2,6 +2,7 @@ import unittest
 from unittest.mock import patch
 import csv
 import gzip
+import httpx
 import io
 import tarfile
 import tempfile
@@ -13,6 +14,64 @@ import opensky_build_scientific_db as scientific_db
 
 
 class OpenSkyBuildScientificDbTestCase(unittest.TestCase):
+    def test_download_to_temporary_file_retries_transient_http_error(self) -> None:
+        class FakeResponse:
+            def __init__(self, status_code: int, chunks: list[bytes] | None = None):
+                self.status_code = status_code
+                self._chunks = chunks or []
+                self.request = httpx.Request("GET", "https://example.com/test.csv.gz")
+
+            def raise_for_status(self) -> None:
+                if self.status_code >= 400:
+                    raise httpx.HTTPStatusError(
+                        f"HTTP {self.status_code}",
+                        request=self.request,
+                        response=httpx.Response(
+                            self.status_code,
+                            request=self.request,
+                        ),
+                    )
+
+            def iter_bytes(self, chunk_size: int) -> list[bytes]:
+                return self._chunks
+
+            def __enter__(self) -> "FakeResponse":
+                return self
+
+            def __exit__(self, exc_type, exc, tb) -> None:
+                return None
+
+        class FakeClient:
+            responses = [
+                FakeResponse(504),
+                FakeResponse(200, [b"abc", b"123"]),
+            ]
+
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def stream(self, method: str, url: str) -> FakeResponse:
+                return self.responses.pop(0)
+
+            def __enter__(self) -> "FakeClient":
+                return self
+
+            def __exit__(self, exc_type, exc, tb) -> None:
+                return None
+
+        with tempfile.TemporaryDirectory() as tmpdir, patch(
+            "opensky_build_scientific_db.httpx.Client",
+            FakeClient,
+        ), patch("opensky_build_scientific_db.time.sleep"):
+            temp_path = scientific_db.download_to_temporary_file(
+                "https://example.com/test.csv.gz",
+                Path(tmpdir),
+                "test.csv.gz",
+            )
+
+            self.assertTrue(temp_path.exists())
+            self.assertEqual(temp_path.read_bytes(), b"abc123")
+
     def test_validate_required_columns_raises_on_missing_columns(self) -> None:
         with self.assertRaises(RuntimeError) as context:
             scientific_db.validate_required_columns(
