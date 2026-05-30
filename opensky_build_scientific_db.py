@@ -58,6 +58,13 @@ Query the local database with the default join:
         --minimum-duration-hours 6 \
         --sample-trajectories 25
 
+Inspect a small unfiltered sample of COVID manifests before building:
+
+    python opensky_build_scientific_db.py inspect-covid \
+        --download-dir /Volumes/external/opensky \
+        --max-covid-files 2 \
+        --max-covid-chunks-per-file 1
+
 The ``build`` command processes source files one at a time through a temporary
 workspace, instead of downloading the full scientific datasets up front.
 
@@ -159,6 +166,25 @@ Notes
 
   That clears ``scientific_flights``, ``scientific_state_vectors``, and
   ``scientific_ingest_manifest`` so the next ``build`` run starts from scratch.
+- If a build inserts zero candidate flights, use ``inspect-covid`` first. It
+  performs a dry-run examination of the COVID source files without inserting
+  anything into PostgreSQL and reports the raw origin/destination frequencies
+  and duration distribution so you can choose better filters.
+
+  Use it like this for a first pass:
+
+      python opensky_build_scientific_db.py inspect-covid \
+      --download-dir /path/to/workspace \
+      --max-covid-files 2 \
+      --max-covid-chunks-per-file 1
+  
+  If you want a broader sample:
+
+      python opensky_build_scientific_db.py inspect-covid \
+      --download-dir /path/to/workspace \
+      --max-covid-files 4 \
+      --max-covid-chunks-per-file 2 \
+      --top-n-airports 30
 """
 
 from __future__ import annotations
@@ -224,6 +250,14 @@ class BuildConfig:
     max_state_archives: int | None = None
 
 
+@dataclass(frozen=True)
+class InspectCovidConfig:
+    download_dir: Path
+    max_covid_files: int = 2
+    max_covid_chunks_per_file: int = 1
+    top_n_airports: int = 20
+
+
 MANIFEST_STATUS_COMPLETED = "completed"
 MANIFEST_STATUS_FAILED = "failed"
 MANIFEST_STATUS_IN_PROGRESS = "in_progress"
@@ -259,6 +293,13 @@ REQUIRED_STATE_COLUMNS = (
 
 
 def normalize_callsign(value: Any) -> str | None:
+    if value is None or pd.isna(value):
+        return None
+    normalized = str(value).strip().upper()
+    return normalized or None
+
+
+def normalize_airport_code(value: Any) -> str | None:
     if value is None or pd.isna(value):
         return None
     normalized = str(value).strip().upper()
@@ -763,6 +804,56 @@ def summarize_covid_filter_counts(
     }
 
 
+def summarize_unfiltered_covid_chunk(chunk: pd.DataFrame) -> pd.DataFrame:
+    summary_df = chunk.copy()
+    summary_df["origin"] = summary_df["origin"].map(normalize_airport_code).astype("string")
+    summary_df["destination"] = summary_df["destination"].map(normalize_airport_code).astype("string")
+    summary_df["callsign"] = (
+        summary_df["callsign"].astype("string").str.strip().str.upper()
+    )
+    summary_df["icao24"] = (
+        summary_df["icao24"].astype("string").str.strip().str.lower()
+    )
+    summary_df["firstseen"] = parse_timestamp_column(summary_df["firstseen"])
+    summary_df["lastseen"] = parse_timestamp_column(summary_df["lastseen"])
+    summary_df["duration_hours"] = (
+        summary_df["lastseen"] - summary_df["firstseen"]
+    ).dt.total_seconds() / 3600.0
+    return summary_df
+
+
+def format_duration_bucket_summary(summary_df: pd.DataFrame) -> dict[str, int]:
+    duration_series = summary_df["duration_hours"]
+    return {
+        "ge_4h": int(duration_series.ge(4).sum()),
+        "ge_6h": int(duration_series.ge(6).sum()),
+        "ge_8h": int(duration_series.ge(8).sum()),
+        "ge_10h": int(duration_series.ge(10).sum()),
+        "ge_12h": int(duration_series.ge(12).sum()),
+    }
+
+
+def build_origin_duration_summary(
+    summary_df: pd.DataFrame,
+    *,
+    top_n_airports: int,
+) -> pd.DataFrame:
+    valid = summary_df[summary_df["origin"].notna()].copy()
+    if valid.empty:
+        return pd.DataFrame(
+            columns=["origin", "rows", "ge_4h", "ge_6h", "ge_8h", "ge_10h", "ge_12h"]
+        )
+
+    grouped = valid.groupby("origin", dropna=True)
+    result = grouped["origin"].size().rename("rows").to_frame()
+    for threshold in (4, 6, 8, 10, 12):
+        result[f"ge_{threshold}h"] = grouped["duration_hours"].apply(
+            lambda series, t=threshold: int(series.ge(t).sum())
+        )
+    result = result.sort_values(["ge_6h", "rows"], ascending=False).head(top_n_airports)
+    return result.reset_index()
+
+
 def filter_covid_chunk(
     chunk: pd.DataFrame,
     origin_airports: Sequence[str],
@@ -958,6 +1049,97 @@ def ingest_filtered_covid_flights_streaming(
             validate_schema=index == 0,
         )
     return total_inserted
+
+
+def inspect_covid_data(config: InspectCovidConfig) -> None:
+    workspace_dir = ensure_workspace(config.download_dir)
+    covid_files = fetch_covid_file_metadata()
+    if not covid_files:
+        raise RuntimeError("Could not discover COVID dataset files.")
+
+    selected_files = list(covid_files[: config.max_covid_files])
+    if not selected_files:
+        raise RuntimeError("No COVID files were selected for inspection.")
+
+    aggregated_frames: list[pd.DataFrame] = []
+    inspected_file_names: list[str] = []
+    first_columns: list[str] | None = None
+
+    for file_metadata in progress(
+        selected_files,
+        desc="Inspect COVID manifests",
+        total=len(selected_files),
+        unit="file",
+    ):
+        source_file = file_metadata["name"]
+        source_url = file_metadata["url"]
+        temp_path: Path | None = None
+        try:
+            temp_path = download_to_temporary_file(source_url, workspace_dir, source_file)
+            print(f"Inspecting flight manifest: {source_file}")
+            chunk_count = 0
+            for chunk in pd.read_csv(temp_path, compression="gzip", chunksize=COVID_CHUNK_ROWS):
+                validate_required_columns(
+                    list(chunk.columns),
+                    REQUIRED_COVID_COLUMNS,
+                    source_label=f"COVID manifest {source_file}",
+                )
+                if first_columns is None:
+                    first_columns = list(chunk.columns)
+                aggregated_frames.append(summarize_unfiltered_covid_chunk(chunk))
+                chunk_count += 1
+                if chunk_count >= config.max_covid_chunks_per_file:
+                    break
+            inspected_file_names.append(source_file)
+        finally:
+            if temp_path is not None and temp_path.exists():
+                temp_path.unlink()
+
+    if not aggregated_frames:
+        raise RuntimeError("No COVID rows were inspected.")
+
+    combined = pd.concat(aggregated_frames, ignore_index=True)
+    print("\n--- COVID Inspection Summary ---")
+    print(f"Files inspected: {len(inspected_file_names)}")
+    print(f"File names: {inspected_file_names}")
+    print(f"Rows inspected: {len(combined)}")
+    if first_columns is not None:
+        print(f"Columns: {first_columns}")
+
+    print("\nTop origin airports by rows:")
+    origin_counts = (
+        combined["origin"]
+        .value_counts(dropna=True)
+        .head(config.top_n_airports)
+        .rename_axis("origin")
+        .reset_index(name="rows")
+    )
+    print(origin_counts.to_string(index=False))
+
+    print("\nTop destination airports by rows:")
+    destination_counts = (
+        combined["destination"]
+        .value_counts(dropna=True)
+        .head(config.top_n_airports)
+        .rename_axis("destination")
+        .reset_index(name="rows")
+    )
+    print(destination_counts.to_string(index=False))
+
+    valid_durations = combined["duration_hours"].dropna()
+    if not valid_durations.empty:
+        print("\nDuration quantiles (hours):")
+        duration_quantiles = valid_durations.quantile([0.25, 0.5, 0.75, 0.9, 0.95]).round(2)
+        print(duration_quantiles.to_string())
+        print("\nDuration bucket counts:")
+        print(format_duration_bucket_summary(combined))
+
+    print("\nTop origins by long-haul counts:")
+    origin_duration_summary = build_origin_duration_summary(
+        combined,
+        top_n_airports=config.top_n_airports,
+    )
+    print(origin_duration_summary.to_string(index=False))
 
 
 def load_candidate_days_from_db(
@@ -1620,6 +1802,34 @@ def build_parser() -> argparse.ArgumentParser:
         help="Required safety flag to confirm truncating scientific DB tables.",
     )
 
+    inspect_covid_parser = subparsers.add_parser(
+        "inspect-covid",
+        help="Dry-run inspection of unfiltered COVID manifests without DB inserts.",
+    )
+    inspect_covid_parser.add_argument(
+        "--download-dir",
+        required=True,
+        help="Temporary workspace directory for one-file-at-a-time source inspection.",
+    )
+    inspect_covid_parser.add_argument(
+        "--max-covid-files",
+        type=int,
+        default=2,
+        help="Number of COVID manifest files to inspect. Default: 2",
+    )
+    inspect_covid_parser.add_argument(
+        "--max-covid-chunks-per-file",
+        type=int,
+        default=1,
+        help="Number of chunks to inspect per COVID file. Default: 1",
+    )
+    inspect_covid_parser.add_argument(
+        "--top-n-airports",
+        type=int,
+        default=20,
+        help="Number of top origins/destinations to print. Default: 20",
+    )
+
     query_parser = subparsers.add_parser(
         "query",
         help="Run the default or a custom SQL query against the scientific DB.",
@@ -1683,6 +1893,17 @@ def main() -> None:
         reset_scientific_db(
             args.database_url,
             confirm=args.confirm_reset,
+        )
+        return
+
+    if args.command == "inspect-covid":
+        inspect_covid_data(
+            InspectCovidConfig(
+                download_dir=Path(args.download_dir),
+                max_covid_files=args.max_covid_files,
+                max_covid_chunks_per_file=args.max_covid_chunks_per_file,
+                top_n_airports=args.top_n_airports,
+            )
         )
         return
 

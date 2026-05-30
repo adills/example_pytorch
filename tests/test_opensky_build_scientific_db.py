@@ -25,6 +25,7 @@ class OpenSkyBuildScientificDbTestCase(unittest.TestCase):
         )
         query_args = parser.parse_args(["query"])
         reset_args = parser.parse_args(["reset-build"])
+        inspect_args = parser.parse_args(["inspect-covid", "--download-dir", "/tmp/opensky"])
 
         self.assertIn("opensky_scientific", build_args.database_url)
         self.assertIn("@localhost/", build_args.database_url)
@@ -32,6 +33,9 @@ class OpenSkyBuildScientificDbTestCase(unittest.TestCase):
         self.assertEqual(query_args.database_url, scientific_db.DEFAULT_DATABASE_URL)
         self.assertEqual(reset_args.database_url, scientific_db.DEFAULT_DATABASE_URL)
         self.assertFalse(reset_args.confirm_reset)
+        self.assertEqual(inspect_args.max_covid_files, 2)
+        self.assertEqual(inspect_args.max_covid_chunks_per_file, 1)
+        self.assertEqual(inspect_args.top_n_airports, 20)
         self.assertEqual(
             build_args.origin_airports,
             ",".join(scientific_db.DEFAULT_ORIGIN_AIRPORTS),
@@ -175,6 +179,23 @@ class OpenSkyBuildScientificDbTestCase(unittest.TestCase):
         self.assertEqual(summary["origin_match_rows"], 2)
         self.assertEqual(summary["duration_match_rows"], 2)
         self.assertEqual(summary["final_match_rows"], 2)
+
+    def test_build_origin_duration_summary_orders_by_long_haul_counts(self) -> None:
+        summary_df = pd.DataFrame(
+            {
+                "origin": ["EGLL", "EGLL", "OMDB", "OMDB", "OMDB", "EDDF"],
+                "duration_hours": [7.5, 5.0, 9.0, 6.5, 3.0, 4.5],
+            }
+        )
+
+        result = scientific_db.build_origin_duration_summary(
+            summary_df,
+            top_n_airports=3,
+        )
+
+        self.assertEqual(result.iloc[0]["origin"], "OMDB")
+        self.assertEqual(int(result.iloc[0]["ge_6h"]), 2)
+        self.assertEqual(int(result.iloc[1]["ge_6h"]), 1)
 
     def test_state_row_to_record_converts_into_database_shape(self) -> None:
         flight = {
