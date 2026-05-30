@@ -6,6 +6,17 @@ import opensky_build_scientific_db as scientific_db
 
 
 class OpenSkyBuildScientificDbTestCase(unittest.TestCase):
+    def test_validate_required_columns_raises_on_missing_columns(self) -> None:
+        with self.assertRaises(RuntimeError) as context:
+            scientific_db.validate_required_columns(
+                ["callsign", "icao24"],
+                scientific_db.REQUIRED_COVID_COLUMNS,
+                source_label="COVID test file",
+            )
+
+        self.assertIn("missing required columns", str(context.exception))
+        self.assertIn("COVID test file", str(context.exception))
+
     def test_build_parser_defaults_to_local_opensky_scientific_database(self) -> None:
         parser = scientific_db.build_parser()
 
@@ -13,11 +24,27 @@ class OpenSkyBuildScientificDbTestCase(unittest.TestCase):
             ["build", "--download-dir", "/tmp/opensky"]
         )
         query_args = parser.parse_args(["query"])
+        reset_args = parser.parse_args(["reset-build"])
 
         self.assertIn("opensky_scientific", build_args.database_url)
         self.assertIn("@localhost/", build_args.database_url)
         self.assertEqual(build_args.database_url, scientific_db.DEFAULT_DATABASE_URL)
         self.assertEqual(query_args.database_url, scientific_db.DEFAULT_DATABASE_URL)
+        self.assertEqual(reset_args.database_url, scientific_db.DEFAULT_DATABASE_URL)
+        self.assertFalse(reset_args.confirm_reset)
+        self.assertEqual(
+            build_args.origin_airports,
+            ",".join(scientific_db.DEFAULT_ORIGIN_AIRPORTS),
+        )
+
+    def test_reset_scientific_db_requires_confirmation(self) -> None:
+        with self.assertRaises(RuntimeError) as context:
+            scientific_db.reset_scientific_db(
+                scientific_db.DEFAULT_DATABASE_URL,
+                confirm=False,
+            )
+
+        self.assertIn("confirm-reset", str(context.exception))
 
     def test_filter_covid_chunk_keeps_only_selected_origins_and_long_flights(self) -> None:
         chunk = pd.DataFrame(
@@ -122,6 +149,32 @@ class OpenSkyBuildScientificDbTestCase(unittest.TestCase):
         )
 
         self.assertEqual([item["name"] for item in selected], ["states_2020-03-23-14.csv.tar"])
+
+    def test_summarize_covid_filter_counts_reports_filter_stages(self) -> None:
+        chunk = pd.DataFrame(
+            {
+                "callsign": ["BAW001 ", "SIA305", "AFR123"],
+                "number": ["BA1", "SQ305", "AF123"],
+                "icao24": ["abc123", "def456", "ghi789"],
+                "registration": ["G-TEST", "9V-AAA", "F-TEST"],
+                "typecode": ["B744", "A359", "A320"],
+                "origin": ["EGLL", "WSSS", "LFPG"],
+                "destination": ["KJFK", "EGLL", "KJFK"],
+                "firstseen": [1704103200, 1704106800, 1704110400],
+                "lastseen": [1704132000, 1704132000, 1704121200],
+            }
+        )
+
+        summary = scientific_db.summarize_covid_filter_counts(
+            chunk,
+            origin_airports=("EGLL", "WSSS"),
+            minimum_duration_hours=6.0,
+        )
+
+        self.assertEqual(summary["total_rows"], 3)
+        self.assertEqual(summary["origin_match_rows"], 2)
+        self.assertEqual(summary["duration_match_rows"], 2)
+        self.assertEqual(summary["final_match_rows"], 2)
 
     def test_state_row_to_record_converts_into_database_shape(self) -> None:
         flight = {

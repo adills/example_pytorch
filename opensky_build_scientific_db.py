@@ -23,11 +23,14 @@ Default scope
 The default airport set is:
 
 - EGLL (London Heathrow)
-- WSSS (Singapore Changi)
+- OMDB (Dubai)
+- OTHH (Doha)
+- EDDF (Frankfurt)
 
-This provides one large European hub and one geographically distant Asia-Pacific
-hub, while still keeping the stored data smaller than a full global ingest.
-These origins are fully configurable at build time.
+This provides a mix of large European and Gulf long-haul hubs with a strong
+chance of producing many international long-duration flights in the historical
+datasets, while still keeping the stored data smaller than a full global
+ingest. These origins are fully configurable at build time.
 
 Schema
 ------
@@ -147,6 +150,15 @@ Notes
 - To reduce intermediate storage, the build path downloads at most one source
   file at a time into the temporary workspace, ingests the filtered rows, and
   then deletes the temporary file.
+- Build progress is resumable through the ``scientific_ingest_manifest`` table.
+  This is usually helpful, but if you change the default origin airports,
+  duration threshold, schema assumptions, or other ingest logic and want a
+  completely fresh rebuild, reset the scientific DB tables first:
+
+      python opensky_build_scientific_db.py reset-build --confirm-reset
+
+  That clears ``scientific_flights``, ``scientific_state_vectors``, and
+  ``scientific_ingest_manifest`` so the next ``build`` run starts from scratch.
 """
 
 from __future__ import annotations
@@ -179,9 +191,9 @@ except ImportError:  # pragma: no cover - optional at runtime
 COVID_RECORD_ID = "7923702"
 COVID_RECORD_URL = f"https://zenodo.org/records/{COVID_RECORD_ID}"
 COVID_RECORD_API_URL = f"https://zenodo.org/api/records/{COVID_RECORD_ID}"
-STATES_BUCKET_LIST_URL = "https://s3.opensky-network.org/"
-STATES_BUCKET_PREFIX = "data-samples/states/"
-DEFAULT_ORIGIN_AIRPORTS = ("EGLL", "WSSS")
+STATES_BUCKET_LIST_URL = "https://s3.opensky-network.org/data-samples/"
+STATES_BUCKET_PREFIX = "states/"
+DEFAULT_ORIGIN_AIRPORTS = ("EGLL", "OMDB", "OTHH", "EDDF")
 DEFAULT_MINIMUM_DURATION_HOURS = 6.0
 DEFAULT_STATE_ARCHIVE_FORMAT = "csv"
 DEFAULT_HTTP_TIMEOUT_SECONDS = 60.0
@@ -215,6 +227,35 @@ class BuildConfig:
 MANIFEST_STATUS_COMPLETED = "completed"
 MANIFEST_STATUS_FAILED = "failed"
 MANIFEST_STATUS_IN_PROGRESS = "in_progress"
+REQUIRED_COVID_COLUMNS = (
+    "callsign",
+    "number",
+    "icao24",
+    "registration",
+    "typecode",
+    "origin",
+    "destination",
+    "firstseen",
+    "lastseen",
+)
+REQUIRED_STATE_COLUMNS = (
+    "time",
+    "icao24",
+    "callsign",
+    "lat",
+    "lon",
+    "velocity",
+    "heading",
+    "vertrate",
+    "onground",
+    "alert",
+    "spi",
+    "squawk",
+    "baroaltitude",
+    "geoaltitude",
+    "lastposupdate",
+    "lastcontact",
+)
 
 
 def normalize_callsign(value: Any) -> str | None:
@@ -664,6 +705,64 @@ def parse_timestamp_column(series: pd.Series) -> pd.Series:
     return pd.to_datetime(numeric_series, unit="s", utc=True)
 
 
+def validate_required_columns(
+    actual_columns: Sequence[str],
+    required_columns: Sequence[str],
+    *,
+    source_label: str,
+) -> None:
+    actual_set = set(actual_columns)
+    missing = [column for column in required_columns if column not in actual_set]
+    if not missing:
+        return
+    raise RuntimeError(
+        f"{source_label} is missing required columns: {missing}. "
+        f"Available columns: {list(actual_columns)}"
+    )
+
+
+def summarize_covid_filter_counts(
+    chunk: pd.DataFrame,
+    *,
+    origin_airports: Sequence[str],
+    minimum_duration_hours: float,
+) -> dict[str, int]:
+    summary_df = chunk.copy()
+    summary_df["origin"] = summary_df["origin"].astype("string")
+    summary_df["firstseen"] = parse_timestamp_column(summary_df["firstseen"])
+    summary_df["lastseen"] = parse_timestamp_column(summary_df["lastseen"])
+    summary_df["duration_hours"] = (
+        summary_df["lastseen"] - summary_df["firstseen"]
+    ).dt.total_seconds() / 3600.0
+
+    total_rows = len(summary_df)
+    origin_match = int(summary_df["origin"].isin(origin_airports).sum())
+    non_null_time_and_origin = int(
+        (
+            summary_df["origin"].notna()
+            & summary_df["firstseen"].notna()
+            & summary_df["lastseen"].notna()
+        ).sum()
+    )
+    duration_match = int(summary_df["duration_hours"].ge(minimum_duration_hours).sum())
+    final_match = int(
+        (
+            summary_df["origin"].isin(origin_airports)
+            & summary_df["duration_hours"].ge(minimum_duration_hours)
+            & summary_df["origin"].notna()
+            & summary_df["firstseen"].notna()
+            & summary_df["lastseen"].notna()
+        ).sum()
+    )
+    return {
+        "total_rows": total_rows,
+        "origin_match_rows": origin_match,
+        "non_null_time_and_origin_rows": non_null_time_and_origin,
+        "duration_match_rows": duration_match,
+        "final_match_rows": final_match,
+    }
+
+
 def filter_covid_chunk(
     chunk: pd.DataFrame,
     origin_airports: Sequence[str],
@@ -756,6 +855,7 @@ def process_covid_file_streaming(
     workspace_dir: Path,
     origin_airports: Sequence[str],
     minimum_duration_hours: float,
+    validate_schema: bool = False,
 ) -> int:
     source_file = file_metadata["name"]
     source_url = file_metadata["url"]
@@ -775,7 +875,28 @@ def process_covid_file_streaming(
     try:
         temp_path = download_to_temporary_file(source_url, workspace_dir, source_file)
         print(f"Processing flight manifest: {source_file}")
+        first_chunk = True
         for chunk in pd.read_csv(temp_path, compression="gzip", chunksize=COVID_CHUNK_ROWS):
+            if validate_schema and first_chunk:
+                validate_required_columns(
+                    list(chunk.columns),
+                    REQUIRED_COVID_COLUMNS,
+                    source_label=f"COVID manifest {source_file}",
+                )
+                print(
+                    "COVID first-file schema check passed. Columns: "
+                    f"{list(chunk.columns)}"
+                )
+                counts = summarize_covid_filter_counts(
+                    chunk,
+                    origin_airports=origin_airports,
+                    minimum_duration_hours=minimum_duration_hours,
+                )
+                print(
+                    "COVID first-file filter summary: "
+                    f"{counts}"
+                )
+                first_chunk = False
             filtered = filter_covid_chunk(
                 chunk,
                 origin_airports=origin_airports,
@@ -822,18 +943,19 @@ def ingest_filtered_covid_flights_streaming(
     minimum_duration_hours: float,
 ) -> int:
     total_inserted = 0
-    for file_metadata in progress(
+    for index, file_metadata in enumerate(progress(
         covid_files,
         desc="Ingest COVID flights",
         total=len(covid_files),
         unit="file",
-    ):
+    )):
         total_inserted += process_covid_file_streaming(
             engine,
             file_metadata=file_metadata,
             workspace_dir=workspace_dir,
             origin_airports=origin_airports,
             minimum_duration_hours=minimum_duration_hours,
+            validate_schema=index == 0,
         )
     return total_inserted
 
@@ -1061,6 +1183,7 @@ def process_state_archive_streaming(
     archive_metadata: dict[str, str],
     workspace_dir: Path,
     candidate_days: set[date],
+    validate_schema: bool = False,
 ) -> int:
     source_file = archive_metadata["name"]
     source_url = archive_metadata["url"]
@@ -1100,8 +1223,21 @@ def process_state_archive_streaming(
         flights_by_icao24 = build_flight_lookup(flights)
         buffered_records: list[dict[str, Any]] = []
 
+        first_member = True
         for member_name, reader in iter_csv_members_from_tar(temp_path):
             print(f"Reading member: {member_name}")
+            if validate_schema and first_member:
+                fieldnames = list(reader.fieldnames or [])
+                validate_required_columns(
+                    fieldnames,
+                    REQUIRED_STATE_COLUMNS,
+                    source_label=f"State archive member {source_file}:{member_name}",
+                )
+                print(
+                    "State first-file schema check passed. Columns: "
+                    f"{fieldnames}"
+                )
+                first_member = False
             row_counter = 0
             match_counter = 0
             for row in reader:
@@ -1175,17 +1311,18 @@ def ingest_matching_state_vectors_streaming(
     candidate_days: set[date],
 ) -> int:
     total_inserted = 0
-    for archive_metadata in progress(
+    for index, archive_metadata in enumerate(progress(
         state_archives,
         desc="Ingest state vectors",
         total=len(state_archives),
         unit="archive",
-    ):
+    )):
         total_inserted += process_state_archive_streaming(
             engine,
             archive_metadata=archive_metadata,
             workspace_dir=workspace_dir,
             candidate_days=candidate_days,
+            validate_schema=index == 0,
         )
     return total_inserted
 
@@ -1345,6 +1482,16 @@ def build_scientific_db(config: BuildConfig) -> None:
     )
     print(f"Identified {len(candidate_days)} candidate UTC days with eligible flights.")
     print(f"Identified {len(candidate_hours)} candidate UTC hourly archives with eligible flights.")
+    if not candidate_days:
+        raise RuntimeError(
+            "No eligible long-haul flights were inserted into scientific_flights. "
+            "This usually means the origin-airport or duration filters are too "
+            "restrictive for the selected COVID files, or the source schema does not "
+            "match the expected origin/destination columns. Diagnose with SQL such as: "
+            "\"SELECT status, source_file, rows_inserted FROM scientific_ingest_manifest "
+            "WHERE source_dataset = 'covid_flight_dataset' ORDER BY source_file;\" and "
+            "\"SELECT COUNT(*) FROM scientific_flights;\""
+        )
 
     state_archives = fetch_state_archive_metadata(config.state_archive_format)
     if not state_archives:
@@ -1371,6 +1518,30 @@ def build_scientific_db(config: BuildConfig) -> None:
         candidate_days=candidate_days,
     )
     print(f"Inserted or refreshed {inserted_state_rows} matching state-vector rows.")
+
+
+def reset_scientific_db(database_url: str, *, confirm: bool) -> None:
+    if not confirm:
+        raise RuntimeError(
+            "Refusing to reset the scientific database without explicit confirmation. "
+            "Re-run with: opensky_build_scientific_db.py reset-build --confirm-reset"
+        )
+
+    engine = get_engine(database_url)
+    create_schema(engine)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                TRUNCATE TABLE
+                    scientific_state_vectors,
+                    scientific_flights,
+                    scientific_ingest_manifest
+                RESTART IDENTITY
+                """
+            )
+        )
+    print("Reset scientific_state_vectors, scientific_flights, and scientific_ingest_manifest.")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1405,7 +1576,7 @@ def build_parser() -> argparse.ArgumentParser:
     build_parser.add_argument(
         "--origin-airports",
         default=",".join(DEFAULT_ORIGIN_AIRPORTS),
-        help="Comma-separated origin airports to retain. Default: EGLL,WSSS",
+        help="Comma-separated origin airports to retain. Default: EGLL,OMDB,OTHH,EDDF",
     )
     build_parser.add_argument(
         "--minimum-duration-hours",
@@ -1429,6 +1600,24 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Optional limit for initial build/testing.",
+    )
+
+    reset_parser = subparsers.add_parser(
+        "reset-build",
+        help="Clear scientific DB tables and ingest history for a clean rebuild.",
+    )
+    reset_parser.add_argument(
+        "--database-url",
+        default=DEFAULT_DATABASE_URL,
+        help=(
+            "SQLAlchemy PostgreSQL URL. Default: "
+            f"{DEFAULT_DATABASE_URL}"
+        ),
+    )
+    reset_parser.add_argument(
+        "--confirm-reset",
+        action="store_true",
+        help="Required safety flag to confirm truncating scientific DB tables.",
     )
 
     query_parser = subparsers.add_parser(
@@ -1488,6 +1677,13 @@ def main() -> None:
             max_state_archives=args.max_state_archives,
         )
         build_scientific_db(config)
+        return
+
+    if args.command == "reset-build":
+        reset_scientific_db(
+            args.database_url,
+            confirm=args.confirm_reset,
+        )
         return
 
     query_df = query_scientific_db(

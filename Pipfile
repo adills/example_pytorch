@@ -16,6 +16,7 @@ torchdiffeq = "*"
 tqdm = "*"
 pyopensky = "*"
 pandas = "*"
+psycopg = "*"
 
 [dev-packages]
 pytest = "*"
