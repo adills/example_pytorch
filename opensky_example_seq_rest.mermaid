@@ -1,0 +1,39 @@
+sequenceDiagram
+    actor User
+    participant CLI as opensky_example.py
+    participant REST as OpenSky REST API
+    participant Step1CSV as long_haul_flights.csv
+    participant Step2CSV as long_distance_trajectories.csv
+    participant Plot as flights_altitude_vs_time.png
+
+    User->>CLI: Run script with --backend rest
+
+    opt Step 1
+        CLI->>REST: Request departures for origin/time window
+        alt Interval > 2 days
+            CLI->>REST: Chunk departure requests into 2-day windows
+            REST-->>CLI: Partial departure batches
+        else Interval <= 2 days
+            REST-->>CLI: Departure batch
+        end
+        CLI->>CLI: Filter long-haul flights by duration and known arrival
+        CLI->>Step1CSV: Save filtered flight manifest
+    end
+
+    opt Step 2
+        CLI->>Step1CSV: Load saved flight manifest
+        CLI->>Step2CSV: Read completed flight_keys if output exists
+        loop Pending flights
+            CLI->>REST: Request track for icao24 at firstSeen
+            alt Track returned
+                REST-->>CLI: Track path rows
+                CLI->>Step2CSV: Append normalized trajectory rows
+            else Rate limited or missing
+                REST-->>CLI: 429 / 404 / transient failure
+                CLI->>CLI: Retry, checkpoint, or skip
+            end
+        end
+        CLI->>Plot: Generate altitude vs time plot
+    end
+
+    CLI-->>User: Saved outputs, retry hints, and summary

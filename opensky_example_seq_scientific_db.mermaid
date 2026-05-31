@@ -1,0 +1,26 @@
+sequenceDiagram
+    actor User
+    participant CLI as opensky_example.py
+    participant DB as Scientific PostgreSQL
+    participant Step1CSV as long_haul_flights.csv
+    participant Step2CSV as long_distance_trajectories.csv
+    participant Plot as flights_altitude_vs_time.png
+
+    User->>CLI: Run script with --backend scientific_db
+
+    opt Step 1
+        CLI->>DB: Query scientific_flights by origin, time window, min duration
+        DB-->>CLI: Matching long-haul flights
+        CLI->>Step1CSV: Save filtered flight manifest
+    end
+
+    opt Step 2
+        CLI->>Step1CSV: Load saved flight manifest
+        CLI->>Step2CSV: Read completed flight_keys if output exists
+        CLI->>DB: Query scientific_state_vectors batches by pending flight_key
+        DB-->>CLI: Joined trajectory rows
+        CLI->>Step2CSV: Append normalized trajectory rows
+        CLI->>Plot: Generate altitude vs time plot
+    end
+
+    CLI-->>User: Saved outputs and summary

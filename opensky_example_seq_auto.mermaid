@@ -1,0 +1,24 @@
+sequenceDiagram
+    actor User
+    participant CLI as opensky_example.py
+    participant Resolver as resolve_backend()
+    participant DB as Scientific PostgreSQL
+    participant Trino as OpenSky Trino
+
+    User->>CLI: Run script with --backend auto
+    CLI->>Resolver: resolve_backend(database_url, step)
+    Resolver->>DB: Check scientific_flights / scientific_state_vectors availability
+
+    alt Scientific DB available
+        DB-->>Resolver: Available
+        Resolver-->>CLI: backend = scientific_db
+        CLI->>DB: Execute Step 1 and/or Step 2 via local DB
+        DB-->>CLI: Flights and/or trajectories
+    else Scientific DB unavailable
+        DB-->>Resolver: Unavailable
+        Resolver-->>CLI: backend = trino
+        CLI->>Trino: Execute Step 1 and/or Step 2 via Trino
+        Trino-->>CLI: Flights and/or trajectories
+    end
+
+    CLI-->>User: CSV outputs, plot, and status messages
