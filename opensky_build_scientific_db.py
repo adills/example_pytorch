@@ -214,6 +214,17 @@ To see what days actually exist in your currently ingested trajectory table, run
         COUNT(*) AS state_rows
     FROM scientific_state_vectors;
 
+To see the available flight wndow for EGLL directly:
+
+    SELECT
+        origin,
+        MIN(firstseen) AS min_firstseen,
+        MAX(lastseen) AS max_lastseen,
+        COUNT(*) AS flights
+    FROM scientific_flights
+    WHERE origin = 'EGLL'
+    GROUP BY origin;
+
 To confirm which hourly archives were ingested, run:
 
     SELECT source_file, rows_inserted
