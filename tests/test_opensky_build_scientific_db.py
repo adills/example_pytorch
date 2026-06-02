@@ -156,6 +156,9 @@ class OpenSkyBuildScientificDbTestCase(unittest.TestCase):
         self.assertIn("WITH filtered_flights AS", sql)
         self.assertIn("scientific_state_vectors", sql)
         self.assertNotIn("sampled_flights", sql)
+        self.assertIn("firstseen >= :start_time", sql)
+        self.assertIn("lastseen <= :end_time", sql)
+        self.assertNotIn("IS NULL", sql)
         self.assertEqual(params["origin_airport"], "EGLL")
         self.assertEqual(params["minimum_duration_hours"], 6.0)
         self.assertEqual(params["start_time"], "2020-01-01 00:00:00")
@@ -170,6 +173,8 @@ class OpenSkyBuildScientificDbTestCase(unittest.TestCase):
 
         self.assertIn("sampled_flights", sql)
         self.assertIn("ORDER BY RANDOM()", sql)
+        self.assertNotIn("start_time", params)
+        self.assertNotIn("end_time", params)
         self.assertEqual(params["sample_trajectories"], 25)
 
     def test_parse_timestamp_column_supports_datetime_strings(self) -> None:

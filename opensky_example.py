@@ -11,12 +11,14 @@ Step 1:
 - Query flight metadata for departures from one origin airport within a time
   window.
 - Filter the returned flights by minimum duration and known arrival airport.
-- Save the filtered flight list to ``long_haul_flights.csv``.
+- Save the filtered flight list to ``long_haul_flights.csv`` when the backend
+  requires it, or when explicitly requested.
 
 Step 2:
 - Load the saved Step 1 flight metadata.
 - Fetch trajectory/state-vector data for each saved flight.
-- Append trajectory rows to ``long_distance_trajectories.csv``.
+- Append trajectory rows to ``long_distance_trajectories.csv`` when the backend
+  requires it, or when explicitly requested.
 - Generate an altitude-vs-time-since-takeoff plot as
   ``flights_altitude_vs_time.png``.
 
@@ -53,13 +55,28 @@ The main user-facing options are:
   Origin airport ICAO identifier. Default: ``EGLL``.
 
 - ``--start-time "YYYY-MM-DD HH:MM:SS"``
-  Inclusive search start timestamp.
+  Inclusive search start timestamp. If omitted for ``scientific_db``, the
+  script uses the actual earliest loaded flight time for the selected origin.
 
 - ``--end-time "YYYY-MM-DD HH:MM:SS"``
-  Inclusive search end timestamp.
+  Inclusive search end timestamp. If omitted for ``scientific_db``, the script
+  uses the actual latest loaded flight time for the selected origin.
 
 - ``--minimum-duration-hours FLOAT``
   Minimum duration threshold used to classify long-haul flights.
+
+- ``--save-step-1-csv``
+  Persist the Step 1 flight manifest. For ``scientific_db``, this is optional
+  and defaults to off.
+
+- ``--save-step-2-csv``
+  Persist the Step 2 trajectory rows. For ``scientific_db``, this is optional
+  and defaults to off.
+
+- ``--plot-min-observed-fraction FLOAT``
+  Minimum fraction of the stored flight duration that must be covered by
+  observed airborne trajectory rows for a flight to be included in the
+  altitude plot.
 
 Example commands
 ----------------
@@ -142,6 +159,8 @@ Notes
 -----
 - Step 2 is resumable because completed flights are tracked via ``flight_key``
   values already present in the Step 2 output CSV.
+- For ``scientific_db``, the script queries PostgreSQL directly and operates on
+  in-memory DataFrames by default. CSV exports are optional.
 - REST Step 2 may stop at a rate-limit checkpoint and print a retry/resume
   command.
 - Trino Step 2 can return much richer state-vector data than REST, even though
@@ -201,6 +220,7 @@ REST_TRACK_MAX_RETRY_AFTER_SECONDS = 30
 TRACK_REQUEST_COOLDOWN_SECONDS = 5
 STEP_2_DEFAULT_RETRY_WAIT_SECONDS = 3600
 SCIENTIFIC_DB_STEP_2_BATCH_SIZE = 500
+MIN_PLOT_OBSERVED_HOURS_FRACTION = 0.25
 
 DEFAULT_BACKEND: BackendName = "auto"
 DEFAULT_STEP: StepName = "1"
@@ -256,6 +276,9 @@ class RunConfig:
     end_time: str
     minimum_duration_hours: float
     database_url: str
+    save_step_1_csv: bool
+    save_step_2_csv: bool
+    plot_min_observed_fraction: float
     paths: OutputPaths
 
 
@@ -300,6 +323,9 @@ def build_run_config(args: argparse.Namespace) -> RunConfig:
         end_time=args.end_time,
         minimum_duration_hours=args.minimum_duration_hours,
         database_url=args.database_url,
+        save_step_1_csv=args.save_step_1_csv,
+        save_step_2_csv=args.save_step_2_csv,
+        plot_min_observed_fraction=args.plot_min_observed_fraction,
         paths=OutputPaths(),
     )
 
@@ -341,13 +367,21 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--start-time",
-        default=DEFAULT_START_TIME,
-        help="Inclusive departure search start timestamp.",
+        default=None,
+        help=(
+            "Inclusive departure search start timestamp. Default: scientific DB "
+            "uses the loaded flight window for the selected origin; other "
+            f"backends use {DEFAULT_START_TIME}."
+        ),
     )
     parser.add_argument(
         "--end-time",
-        default=DEFAULT_END_TIME,
-        help="Inclusive departure search end timestamp.",
+        default=None,
+        help=(
+            "Inclusive departure search end timestamp. Default: scientific DB "
+            "uses the loaded flight window for the selected origin; other "
+            f"backends use {DEFAULT_END_TIME}."
+        ),
     )
     parser.add_argument(
         "--minimum-duration-hours",
@@ -355,7 +389,99 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_MINIMUM_DURATION_HOURS,
         help="Minimum duration in hours for a flight to count as long-haul.",
     )
+    parser.add_argument(
+        "--save-step-1-csv",
+        action="store_true",
+        help=(
+            "Save the Step 1 flight manifest to CSV. For scientific_db this is "
+            "optional and defaults to off."
+        ),
+    )
+    parser.add_argument(
+        "--save-step-2-csv",
+        action="store_true",
+        help=(
+            "Save the Step 2 trajectory rows to CSV. For scientific_db this is "
+            "optional and defaults to off."
+        ),
+    )
+    parser.add_argument(
+        "--plot-min-observed-fraction",
+        type=float,
+        default=MIN_PLOT_OBSERVED_HOURS_FRACTION,
+        help=(
+            "Minimum observed airborne coverage fraction required for a flight "
+            f"to appear in the altitude plot. Default: "
+            f"{MIN_PLOT_OBSERVED_HOURS_FRACTION}."
+        ),
+    )
     return parser.parse_args()
+
+
+def get_scientific_db_flight_window(
+    database_url: str,
+    origin_airport: str,
+) -> tuple[pd.Timestamp, pd.Timestamp] | None:
+    sql = """
+    SELECT
+        MIN(firstseen) AS min_firstseen,
+        MAX(lastseen) AS max_lastseen
+    FROM scientific_flights
+    WHERE origin = :origin_airport
+    """
+    window_df = pd.read_sql_query(
+        text(sql),
+        get_engine(database_url),
+        params={"origin_airport": origin_airport},
+    )
+    if window_df.empty:
+        return None
+
+    min_firstseen = window_df.loc[0, "min_firstseen"]
+    max_lastseen = window_df.loc[0, "max_lastseen"]
+    if pd.isna(min_firstseen) or pd.isna(max_lastseen):
+        return None
+
+    return (
+        pd.Timestamp(min_firstseen).tz_convert("UTC"),
+        pd.Timestamp(max_lastseen).tz_convert("UTC"),
+    )
+
+
+def resolve_time_window(
+    requested_start: str | None,
+    requested_end: str | None,
+    *,
+    backend: ResolvedBackendName,
+    database_url: str,
+    origin_airport: str,
+) -> tuple[str, str]:
+    if backend != "scientific_db":
+        return (
+            requested_start or DEFAULT_START_TIME,
+            requested_end or DEFAULT_END_TIME,
+        )
+
+    flight_window = get_scientific_db_flight_window(database_url, origin_airport)
+    if flight_window is None:
+        raise RuntimeError(
+            "Scientific DB backend was selected, but no flight window could be "
+            f"found for origin {origin_airport}. Build the local scientific DB "
+            "first or choose another origin."
+        )
+
+    min_firstseen, max_lastseen = flight_window
+    resolved_start = requested_start or min_firstseen.strftime("%Y-%m-%d %H:%M:%S")
+    resolved_end = requested_end or max_lastseen.strftime("%Y-%m-%d %H:%M:%S")
+
+    if requested_start is None or requested_end is None:
+        print(
+            "Using scientific DB flight window for "
+            f"{origin_airport}: {min_firstseen.strftime('%Y-%m-%d %H:%M:%S %Z')} "
+            f"to {max_lastseen.strftime('%Y-%m-%d %H:%M:%S %Z')}."
+        )
+
+    return resolved_start, resolved_end
 
 
 def scientific_db_is_available(
@@ -410,18 +536,22 @@ def resolve_backend(
 def plot_altitude_vs_time_since_takeoff(
     trajectory_df: pd.DataFrame,
     plot_output_path: Path,
+    minimum_observed_hours_fraction: float,
 ) -> None:
     fig, ax = plt.subplots(figsize=(10, 6))
+    plotted_flights = 0
+    skipped_flights = 0
 
     for (_, callsign, destination), flight_df in trajectory_df.groupby(
         ["flight_key", "callsign", "destination"], dropna=False
     ):
-        flight_df = flight_df.sort_values("time").copy()
-        first_time = flight_df["time"].iloc[0]
-        flight_df["plot_altitude_m"] = select_altitude_for_plot(flight_df)
-        flight_df["hours_since_takeoff"] = (
-            pd.to_datetime(flight_df["time"]) - pd.to_datetime(first_time)
-        ).dt.total_seconds() / 3600
+        flight_df = prepare_flight_for_altitude_plot(
+            flight_df,
+            minimum_observed_hours_fraction=minimum_observed_hours_fraction,
+        )
+        if flight_df.empty:
+            skipped_flights += 1
+            continue
 
         label = f"{str(callsign).strip()} -> {destination}"
         ax.plot(
@@ -429,15 +559,21 @@ def plot_altitude_vs_time_since_takeoff(
             flight_df["plot_altitude_m"],
             label=label,
         )
+        plotted_flights += 1
 
     ax.set_xlabel("Hours Since Takeoff")
     ax.set_ylabel("Altitude (m)")
     ax.set_title("Altitude vs Time Since Takeoff")
     ax.grid(True, alpha=0.3)
-    ax.legend()
+    if plotted_flights > 0:
+        ax.legend()
     fig.tight_layout()
     fig.savefig(plot_output_path, dpi=150)
     print(f"Saved plot to {plot_output_path}")
+    print(
+        f"Plotted {plotted_flights} flights and skipped {skipped_flights} "
+        f"for insufficient observed airborne coverage."
+    )
     if interactive_backend:
         plt.show()
     plt.close(fig)
@@ -453,6 +589,45 @@ def select_altitude_for_plot(trajectory_df: pd.DataFrame) -> pd.Series:
         baroaltitude = pd.Series(pd.NA, index=trajectory_df.index, dtype="Float64")
 
     return geoaltitude.fillna(baroaltitude)
+
+
+def prepare_flight_for_altitude_plot(
+    flight_df: pd.DataFrame,
+    *,
+    minimum_observed_hours_fraction: float,
+) -> pd.DataFrame:
+    prepared_df = flight_df.sort_values("time").copy()
+    if "onground" in prepared_df.columns:
+        prepared_df = prepared_df.loc[
+            ~prepared_df["onground"].fillna(False).astype(bool)
+        ].copy()
+    if prepared_df.empty:
+        return prepared_df
+
+    prepared_df["plot_altitude_m"] = select_altitude_for_plot(prepared_df)
+    prepared_df = prepared_df.loc[prepared_df["plot_altitude_m"].notna()].copy()
+    if prepared_df.empty:
+        return prepared_df
+
+    first_seen = pd.to_datetime(prepared_df["first_seen"].iloc[0], utc=True)
+    prepared_df["hours_since_takeoff"] = (
+        pd.to_datetime(prepared_df["time"], utc=True) - first_seen
+    ).dt.total_seconds() / 3600
+
+    duration_hours = pd.to_numeric(
+        pd.Series([prepared_df["duration_hours"].iloc[0]]),
+        errors="coerce",
+    ).iloc[0]
+    if pd.notna(duration_hours) and duration_hours > 0:
+        observed_hours = (
+            pd.to_datetime(prepared_df["time"]).max()
+            - pd.to_datetime(prepared_df["time"]).min()
+        ).total_seconds() / 3600
+        observed_fraction = observed_hours / float(duration_hours)
+        if observed_fraction < minimum_observed_hours_fraction:
+            return prepared_df.iloc[0:0].copy()
+
+    return prepared_df
 
 
 def fetch_departure_chunk_rest(
@@ -828,6 +1003,22 @@ def fetch_track_batch_scientific_db(
     )
 
 
+def fetch_trajectories_step_2_scientific_db(
+    config: RunConfig,
+    client: ScientificDbClient,
+) -> pd.DataFrame:
+    trajectory_df = query_scientific_db(
+        client.database_url,
+        origin_airport=config.origin_airport,
+        minimum_duration_hours=config.minimum_duration_hours,
+        start_time=config.start_time,
+        end_time=config.end_time,
+    )
+    if trajectory_df.empty:
+        return trajectory_df
+    return standardize_step_2_schema(trajectory_df)
+
+
 def normalize_rest_track_dataframe(
     track_df: pd.DataFrame,
     flight: pd.Series,
@@ -1014,8 +1205,10 @@ def print_step_2_summary(
     plot_altitude_vs_time_since_takeoff(
         final_trajectory_df,
         config.paths.plot_output_path,
+        config.plot_min_observed_fraction,
     )
-    print(f"Trajectory output is stored at {config.paths.step_2_output_path}")
+    if config.save_step_2_csv:
+        print(f"Trajectory output is stored at {config.paths.step_2_output_path}")
     if stopped_early:
         print("Step 2 paused at a rate-limit checkpoint. Resume with:")
         print(f"python opensky_example.py --step 2 --backend {config.backend}")
@@ -1060,7 +1253,8 @@ def run_step_1_rest(
             ]
         ].head()
     )
-    save_step_1_results(long_haul_flights, config.paths.step_1_output_path)
+    if config.save_step_1_csv:
+        save_step_1_results(long_haul_flights, config.paths.step_1_output_path)
 
 
 def run_step_1_trino(
@@ -1110,7 +1304,8 @@ def run_step_1_trino(
             ]
         ].head()
     )
-    save_step_1_results(long_haul_flights, config.paths.step_1_output_path)
+    if config.save_step_1_csv:
+        save_step_1_results(long_haul_flights, config.paths.step_1_output_path)
 
 
 def run_step_1_scientific_db(
@@ -1131,10 +1326,26 @@ def run_step_1_scientific_db(
         ) from exc
 
     if long_haul_flights.empty:
+        available_window = get_scientific_db_flight_window(
+            client.database_url,
+            config.origin_airport,
+        )
         print(
             "No flights returned by the local scientific DB for that airport "
             "and time window."
         )
+        if available_window is not None:
+            min_firstseen, max_lastseen = available_window
+            print(
+                "Requested window: "
+                f"{config.start_time} to {config.end_time}."
+            )
+            print(
+                "Available scientific DB window for "
+                f"{config.origin_airport}: "
+                f"{min_firstseen.strftime('%Y-%m-%d %H:%M:%S %Z')} to "
+                f"{max_lastseen.strftime('%Y-%m-%d %H:%M:%S %Z')}."
+            )
         raise SystemExit(0)
 
     print(
@@ -1156,7 +1367,10 @@ def run_step_1_scientific_db(
             ]
         ].head()
     )
-    save_step_1_results(long_haul_flights, config.paths.step_1_output_path)
+    if config.save_step_1_csv:
+        save_step_1_results(long_haul_flights, config.paths.step_1_output_path)
+    else:
+        print("Step 1 CSV export skipped for scientific_db.")
 
 
 def run_step_2_rest(
@@ -1300,68 +1514,40 @@ def run_step_2_scientific_db(
     client: ScientificDbClient,
 ) -> None:
     print(
-        "\n--- Step 2 (scientific_db): Loading trajectories from saved Step 1 "
-        "results via local PostgreSQL ---"
+        "\n--- Step 2 (scientific_db): Loading trajectories directly from "
+        "local PostgreSQL ---"
     )
+    try:
+        trajectory_df = fetch_trajectories_step_2_scientific_db(config, client)
+    except Exception as exc:
+        raise RuntimeError(
+            "Scientific DB Step 2 failed. Check that the local PostgreSQL "
+            "database exists, is reachable, and contains trajectory rows."
+        ) from exc
 
-    long_haul_flights = load_step_1_results(config.paths.step_1_output_path)
-    completed_flight_keys = load_completed_flight_keys(
-        config.paths.step_2_output_path
-    )
-    pending_flights = long_haul_flights[
-        ~long_haul_flights["flight_key"].astype(str).isin(completed_flight_keys)
-    ].copy()
-
-    print(
-        f"Loaded {len(long_haul_flights)} saved flights. "
-        f"{len(completed_flight_keys)} already have trajectory rows. "
-        f"{len(pending_flights)} remain."
-    )
-
-    if pending_flights.empty:
-        final_trajectory_df = load_step_2_results(config.paths.step_2_output_path)
-        print_step_2_summary(final_trajectory_df, config, stopped_early=False)
+    if trajectory_df.empty:
+        print(
+            "No trajectory rows returned by the local scientific DB for that "
+            "origin, time window, and duration filter."
+        )
         return
 
-    pending_keys = pending_flights["flight_key"].astype(str).tolist()
-    total_batches = (
-        len(pending_keys) + SCIENTIFIC_DB_STEP_2_BATCH_SIZE - 1
-    ) // SCIENTIFIC_DB_STEP_2_BATCH_SIZE
+    matched_flights = trajectory_df["flight_key"].nunique()
+    print(
+        f"Loaded {len(trajectory_df)} trajectory rows across "
+        f"{matched_flights} flights from local scientific DB."
+    )
 
-    total_rows_saved = 0
-    for batch_index, start in enumerate(
-        range(0, len(pending_keys), SCIENTIFIC_DB_STEP_2_BATCH_SIZE),
-        start=1,
-    ):
-        batch_keys = pending_keys[start : start + SCIENTIFIC_DB_STEP_2_BATCH_SIZE]
+    if config.save_step_2_csv:
+        trajectory_df.to_csv(config.paths.step_2_output_path, index=False)
         print(
-            f"[{batch_index}/{total_batches}] Loading trajectories for "
-            f"{len(batch_keys)} flights from local scientific DB..."
+            f"Saved {len(trajectory_df)} trajectory rows to "
+            f"{config.paths.step_2_output_path}"
         )
-        try:
-            track_df = fetch_track_batch_scientific_db(
-                client.database_url,
-                batch_keys,
-            )
-        except Exception as exc:
-            raise RuntimeError(
-                "Scientific DB Step 2 failed. Check that the local PostgreSQL "
-                "database exists, is reachable, and contains trajectory rows."
-            ) from exc
+    else:
+        print("Step 2 CSV export skipped for scientific_db.")
 
-        if track_df.empty:
-            continue
-
-        append_tracks_to_output(track_df, config.paths.step_2_output_path)
-        total_rows_saved += len(track_df)
-        print(
-            f"Saved {len(track_df)} trajectory rows for batch {batch_index} "
-            f"to {config.paths.step_2_output_path}"
-        )
-
-    print(f"Saved {total_rows_saved} total trajectory rows from local scientific DB.")
-    final_trajectory_df = load_step_2_results(config.paths.step_2_output_path)
-    print_step_2_summary(final_trajectory_df, config, stopped_early=False)
+    print_step_2_summary(trajectory_df, config, stopped_early=False)
 
 
 def run_step_1(
@@ -1405,7 +1591,19 @@ def main() -> None:
         database_url=args.database_url,
         step=args.step,
     )
+    resolved_start_time, resolved_end_time = resolve_time_window(
+        args.start_time,
+        args.end_time,
+        backend=resolved_backend,
+        database_url=args.database_url,
+        origin_airport=args.origin_airport,
+    )
     args.backend = resolved_backend
+    args.start_time = resolved_start_time
+    args.end_time = resolved_end_time
+    if resolved_backend != "scientific_db":
+        args.save_step_1_csv = True
+        args.save_step_2_csv = True
     config = build_run_config(args)
     client = make_backend_client(config.backend, config.database_url)
 

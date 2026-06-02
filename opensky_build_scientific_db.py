@@ -1813,9 +1813,17 @@ def build_default_trajectory_query(
     params: dict[str, Any] = {
         "origin_airport": origin_airport,
         "minimum_duration_hours": minimum_duration_hours,
-        "start_time": start_time,
-        "end_time": end_time,
     }
+    where_clauses = [
+        "origin = :origin_airport",
+        "duration_hours >= :minimum_duration_hours",
+    ]
+    if start_time is not None:
+        params["start_time"] = start_time
+        where_clauses.append("firstseen >= :start_time")
+    if end_time is not None:
+        params["end_time"] = end_time
+        where_clauses.append("lastseen <= :end_time")
 
     sampled_cte = ""
     source_name = "filtered_flights"
@@ -1835,10 +1843,7 @@ def build_default_trajectory_query(
     WITH filtered_flights AS (
         SELECT *
         FROM scientific_flights
-        WHERE origin = :origin_airport
-          AND duration_hours >= :minimum_duration_hours
-          AND (:start_time IS NULL OR firstseen >= :start_time)
-          AND (:end_time IS NULL OR lastseen <= :end_time)
+        WHERE {' AND '.join(where_clauses)}
     )
     {sampled_cte}
     SELECT

@@ -224,7 +224,14 @@ class OpenSkyExampleTestCase(unittest.TestCase):
         tmpdir: str,
         backend: opensky_example.ResolvedBackendName = "rest",
         step: opensky_example.StepName = "1",
+        save_step_1_csv: bool | None = None,
+        save_step_2_csv: bool | None = None,
+        plot_min_observed_fraction: float = opensky_example.MIN_PLOT_OBSERVED_HOURS_FRACTION,
     ) -> opensky_example.RunConfig:
+        if save_step_1_csv is None:
+            save_step_1_csv = backend != "scientific_db"
+        if save_step_2_csv is None:
+            save_step_2_csv = backend != "scientific_db"
         return opensky_example.RunConfig(
             backend=backend,
             step=step,
@@ -233,6 +240,9 @@ class OpenSkyExampleTestCase(unittest.TestCase):
             end_time="2026-01-01 23:59:59",
             minimum_duration_hours=6,
             database_url="postgresql+psycopg://tester@localhost/opensky_scientific",
+            save_step_1_csv=save_step_1_csv,
+            save_step_2_csv=save_step_2_csv,
+            plot_min_observed_fraction=plot_min_observed_fraction,
             paths=self.make_paths(tmpdir),
         )
 
@@ -243,6 +253,14 @@ class OpenSkyExampleTestCase(unittest.TestCase):
         self.assertEqual(args.backend, "auto")
         self.assertEqual(args.step, "1")
         self.assertEqual(args.origin_airport, opensky_example.DEFAULT_ORIGIN_AIRPORT)
+        self.assertIsNone(args.start_time)
+        self.assertIsNone(args.end_time)
+        self.assertFalse(args.save_step_1_csv)
+        self.assertFalse(args.save_step_2_csv)
+        self.assertEqual(
+            args.plot_min_observed_fraction,
+            opensky_example.MIN_PLOT_OBSERVED_HOURS_FRACTION,
+        )
         self.assertEqual(
             args.minimum_duration_hours,
             opensky_example.DEFAULT_MINIMUM_DURATION_HOURS,
@@ -261,6 +279,26 @@ class OpenSkyExampleTestCase(unittest.TestCase):
             )
 
         self.assertEqual(backend, "scientific_db")
+
+    def test_resolve_time_window_uses_scientific_db_flight_window_defaults(self) -> None:
+        with mock.patch.object(
+            opensky_example,
+            "get_scientific_db_flight_window",
+            return_value=(
+                pd.Timestamp("2018-12-31 08:48:25", tz="UTC"),
+                pd.Timestamp("2022-12-31 23:58:29", tz="UTC"),
+            ),
+        ):
+            start_time, end_time = opensky_example.resolve_time_window(
+                None,
+                None,
+                backend="scientific_db",
+                database_url="postgresql+psycopg://tester@localhost/opensky_scientific",
+                origin_airport="EGLL",
+            )
+
+        self.assertEqual(start_time, "2018-12-31 08:48:25")
+        self.assertEqual(end_time, "2022-12-31 23:58:29")
 
     def test_run_step_1_rest_writes_step_1_csv(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -288,9 +326,28 @@ class OpenSkyExampleTestCase(unittest.TestCase):
             self.assertIn("estArrivalAirport", saved_df.columns)
             self.assertTrue((saved_df["source_backend"] == "trino").all())
 
-    def test_run_step_1_scientific_db_writes_step_1_csv(self) -> None:
+    def test_run_step_1_scientific_db_skips_csv_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             config = self.make_config(tmpdir, backend="scientific_db", step="1")
+            client = opensky_example.ScientificDbClient(config.database_url)
+
+            with mock.patch.object(
+                opensky_example,
+                "fetch_flights_step_1_scientific_db",
+                return_value=make_scientific_step_1_frame(),
+            ):
+                opensky_example.run_step_1_scientific_db(config, client)
+
+            self.assertFalse(config.paths.step_1_output_path.exists())
+
+    def test_run_step_1_scientific_db_can_write_step_1_csv(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = self.make_config(
+                tmpdir,
+                backend="scientific_db",
+                step="1",
+                save_step_1_csv=True,
+            )
             client = opensky_example.ScientificDbClient(config.database_url)
 
             with mock.patch.object(
@@ -360,18 +417,40 @@ class OpenSkyExampleTestCase(unittest.TestCase):
             self.assertIn("heading", saved_df.columns)
             self.assertIn("geoaltitude", saved_df.columns)
 
-    def test_run_step_2_scientific_db_writes_step_2_csv(self) -> None:
+    def test_run_step_2_scientific_db_uses_in_memory_results_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             config = self.make_config(tmpdir, backend="scientific_db", step="2")
-            step_1_df = make_scientific_step_1_frame().head(1)
-            step_1_df.to_csv(config.paths.step_1_output_path, index=False)
             client = opensky_example.ScientificDbClient(config.database_url)
 
             with mock.patch.object(
                 opensky_example,
-                "fetch_track_batch_scientific_db",
+                "fetch_trajectories_step_2_scientific_db",
                 return_value=make_scientific_track_frame(
-                    step_1_df.iloc[0]["flight_key"]
+                    make_scientific_step_1_frame().iloc[0]["flight_key"]
+                ),
+            ), mock.patch.object(
+                opensky_example,
+                "plot_altitude_vs_time_since_takeoff",
+            ):
+                opensky_example.run_step_2_scientific_db(config, client)
+
+            self.assertFalse(config.paths.step_2_output_path.exists())
+
+    def test_run_step_2_scientific_db_can_write_step_2_csv(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = self.make_config(
+                tmpdir,
+                backend="scientific_db",
+                step="2",
+                save_step_2_csv=True,
+            )
+            client = opensky_example.ScientificDbClient(config.database_url)
+
+            with mock.patch.object(
+                opensky_example,
+                "fetch_trajectories_step_2_scientific_db",
+                return_value=make_scientific_track_frame(
+                    make_scientific_step_1_frame().iloc[0]["flight_key"]
                 ),
             ), mock.patch.object(
                 opensky_example,
@@ -394,6 +473,71 @@ class OpenSkyExampleTestCase(unittest.TestCase):
         result = opensky_example.select_altitude_for_plot(frame)
 
         self.assertEqual(list(result), [1000.0, 2000.0, 3000.0])
+
+    def test_prepare_flight_for_altitude_plot_uses_first_seen_and_drops_onground(self) -> None:
+        frame = pd.DataFrame(
+            {
+                "time": pd.to_datetime(
+                    [
+                        "2026-01-01 11:00:00",
+                        "2026-01-01 12:00:00",
+                        "2026-01-01 13:00:00",
+                    ],
+                    utc=True,
+                ),
+                "first_seen": pd.to_datetime(
+                    [
+                        "2026-01-01 10:00:00",
+                        "2026-01-01 10:00:00",
+                        "2026-01-01 10:00:00",
+                    ],
+                    utc=True,
+                ),
+                "duration_hours": [8.0, 8.0, 8.0],
+                "onground": [True, False, False],
+                "geoaltitude": [0.0, 1000.0, 2000.0],
+                "baroaltitude": [0.0, 900.0, 1900.0],
+            }
+        )
+
+        result = opensky_example.prepare_flight_for_altitude_plot(
+            frame,
+            minimum_observed_hours_fraction=0.1,
+        )
+
+        self.assertEqual(len(result), 2)
+        self.assertEqual(list(result["hours_since_takeoff"]), [2.0, 3.0])
+
+    def test_prepare_flight_for_altitude_plot_requires_minimum_observed_fraction(self) -> None:
+        frame = pd.DataFrame(
+            {
+                "time": pd.to_datetime(
+                    [
+                        "2026-01-01 10:00:00",
+                        "2026-01-01 10:30:00",
+                    ],
+                    utc=True,
+                ),
+                "first_seen": pd.to_datetime(
+                    [
+                        "2026-01-01 10:00:00",
+                        "2026-01-01 10:00:00",
+                    ],
+                    utc=True,
+                ),
+                "duration_hours": [8.0, 8.0],
+                "onground": [False, False],
+                "geoaltitude": [1000.0, 2000.0],
+                "baroaltitude": [900.0, 1900.0],
+            }
+        )
+
+        result = opensky_example.prepare_flight_for_altitude_plot(
+            frame,
+            minimum_observed_hours_fraction=0.25,
+        )
+
+        self.assertTrue(result.empty)
 
     def test_normalize_rest_track_dataframe_maps_into_trino_schema(self) -> None:
         flight = make_step_1_saved_frame().iloc[0]
