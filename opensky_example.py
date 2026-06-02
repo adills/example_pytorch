@@ -3,7 +3,9 @@ OpenSky long-haul flight and trajectory example.
 
 This script demonstrates a two-step workflow for retrieving long-haul flights
 from OpenSky or a local scientific PostgreSQL database and then building a
-trajectory dataset for those flights.
+trajectory dataset for those flights. It can also be imported and used as a
+small library to return in-memory ``pandas.DataFrame`` objects for downstream
+processing.
 
 Workflow
 --------
@@ -103,6 +105,42 @@ Run Step 1 with REST:
 Resume a rate-limited REST Step 2 run:
 
     python opensky_example.py --step 2 --backend rest
+
+Programmatic use
+----------------
+To retrieve trajectories directly as a ``DataFrame`` from another script:
+
+    import opensky_example
+
+    config = opensky_example.RunConfig(
+        backend="scientific_db",
+        step="both",
+        origin_airport="EGLL",
+        start_time="2018-12-31 08:48:25",
+        end_time="2022-12-31 23:58:29",
+        minimum_duration_hours=6,
+        database_url=opensky_example.DEFAULT_DATABASE_URL,
+        save_step_1_csv=False,
+        save_step_2_csv=False,
+        plot_min_observed_fraction=0.25,
+        apply_spike_filter=False,
+        spike_min_deviation_m=200.0,
+        spike_max_window_seconds=120.0,
+        apply_gap_filter=False,
+        gap_threshold_seconds=600.0,
+        gap_min_observed_fraction=0.25,
+        paths=opensky_example.OutputPaths(),
+    )
+    trajectory_df = opensky_example.get_trajectory_df(config)
+
+Or use the convenience wrapper for the scientific DB backend:
+
+    trajectory_df = opensky_example.get_scientific_trajectory_df(
+        origin_airport="EGLL",
+        minimum_duration_hours=6,
+        apply_spike_filter=True,
+        apply_gap_filter=True,
+    )
 
 Requirements
 ------------
@@ -279,6 +317,12 @@ class RunConfig:
     save_step_1_csv: bool
     save_step_2_csv: bool
     plot_min_observed_fraction: float
+    apply_spike_filter: bool
+    spike_min_deviation_m: float
+    spike_max_window_seconds: float
+    apply_gap_filter: bool
+    gap_threshold_seconds: float
+    gap_min_observed_fraction: float
     paths: OutputPaths
 
 
@@ -326,6 +370,12 @@ def build_run_config(args: argparse.Namespace) -> RunConfig:
         save_step_1_csv=args.save_step_1_csv,
         save_step_2_csv=args.save_step_2_csv,
         plot_min_observed_fraction=args.plot_min_observed_fraction,
+        apply_spike_filter=args.apply_spike_filter,
+        spike_min_deviation_m=args.spike_min_deviation_m,
+        spike_max_window_seconds=args.spike_max_window_seconds,
+        apply_gap_filter=args.apply_gap_filter,
+        gap_threshold_seconds=args.gap_threshold_seconds,
+        gap_min_observed_fraction=args.gap_min_observed_fraction,
         paths=OutputPaths(),
     )
 
@@ -340,8 +390,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--step",
         choices=["1", "2", "both"],
-        default=DEFAULT_STEP,
-        help="Which workflow step to run: 1, 2, or both.",
+        default=None,
+        help=(
+            "Which workflow step to run: 1, 2, or both. Default: scientific_db "
+            f"uses both; other backends use {DEFAULT_STEP}."
+        ),
     )
     parser.add_argument(
         "--backend",
@@ -415,7 +468,71 @@ def parse_args() -> argparse.Namespace:
             f"{MIN_PLOT_OBSERVED_HOURS_FRACTION}."
         ),
     )
+    parser.add_argument(
+        "--apply-spike-filter",
+        action="store_true",
+        help=(
+            "Apply a local-consistency altitude spike filter to the in-memory "
+            "trajectory DataFrame before plotting or returning it."
+        ),
+    )
+    parser.add_argument(
+        "--spike-min-deviation-m",
+        type=float,
+        default=200.0,
+        help=(
+            "Minimum altitude deviation in meters for the local-consistency "
+            "spike filter. Default: 200."
+        ),
+    )
+    parser.add_argument(
+        "--spike-max-window-seconds",
+        type=float,
+        default=120.0,
+        help=(
+            "Maximum surrounding time window in seconds for the "
+            "local-consistency spike filter. Default: 120."
+        ),
+    )
+    parser.add_argument(
+        "--apply-gap-filter",
+        action="store_true",
+        help=(
+            "Keep only the best contiguous trajectory segment per flight when "
+            "large observation gaps are present."
+        ),
+    )
+    parser.add_argument(
+        "--gap-threshold-seconds",
+        type=float,
+        default=600.0,
+        help=(
+            "Gap threshold in seconds used to split discontinuous trajectory "
+            "segments. Default: 600."
+        ),
+    )
+    parser.add_argument(
+        "--gap-min-observed-fraction",
+        type=float,
+        default=0.25,
+        help=(
+            "Minimum fraction of stored flight duration that the retained "
+            "contiguous segment must cover after gap filtering. Default: 0.25."
+        ),
+    )
     return parser.parse_args()
+
+
+def resolve_step(
+    requested_step: StepName | None,
+    *,
+    backend: ResolvedBackendName,
+) -> StepName:
+    if requested_step is not None:
+        return requested_step
+    if backend == "scientific_db":
+        return "both"
+    return DEFAULT_STEP
 
 
 def get_scientific_db_flight_window(
@@ -589,6 +706,146 @@ def select_altitude_for_plot(trajectory_df: pd.DataFrame) -> pd.Series:
         baroaltitude = pd.Series(pd.NA, index=trajectory_df.index, dtype="Float64")
 
     return geoaltitude.fillna(baroaltitude)
+
+
+def filter_flight_altitude_spikes(
+    flight_df: pd.DataFrame,
+    *,
+    minimum_deviation_m: float,
+    max_window_seconds: float,
+) -> pd.DataFrame:
+    filtered_df = flight_df.sort_values("time").copy()
+    if len(filtered_df) < 3:
+        return filtered_df
+
+    filtered_df["clean_altitude_m"] = pd.to_numeric(
+        select_altitude_for_plot(filtered_df),
+        errors="coerce",
+    )
+    filtered_df["clean_time"] = pd.to_datetime(filtered_df["time"], utc=True)
+
+    spike_rows: set[int] = set()
+    row_indexes = list(filtered_df.index)
+    for position in range(1, len(row_indexes) - 1):
+        prev_index = row_indexes[position - 1]
+        curr_index = row_indexes[position]
+        next_index = row_indexes[position + 1]
+
+        prev_alt = filtered_df.at[prev_index, "clean_altitude_m"]
+        curr_alt = filtered_df.at[curr_index, "clean_altitude_m"]
+        next_alt = filtered_df.at[next_index, "clean_altitude_m"]
+        if pd.isna(prev_alt) or pd.isna(curr_alt) or pd.isna(next_alt):
+            continue
+
+        prev_time = filtered_df.at[prev_index, "clean_time"]
+        curr_time = filtered_df.at[curr_index, "clean_time"]
+        next_time = filtered_df.at[next_index, "clean_time"]
+        prev_window_seconds = (curr_time - prev_time).total_seconds()
+        next_window_seconds = (next_time - curr_time).total_seconds()
+        full_window_seconds = (next_time - prev_time).total_seconds()
+        if (
+            prev_window_seconds <= 0
+            or next_window_seconds <= 0
+            or prev_window_seconds > max_window_seconds
+            or next_window_seconds > max_window_seconds
+            or full_window_seconds > 2 * max_window_seconds
+        ):
+            continue
+
+        interpolated_alt = float(prev_alt) + (
+            float(next_alt) - float(prev_alt)
+        ) * (prev_window_seconds / full_window_seconds)
+        if abs(float(curr_alt) - interpolated_alt) < minimum_deviation_m:
+            continue
+
+        spike_rows.add(curr_index)
+
+    filtered_df = filtered_df.drop(index=list(spike_rows))
+    return filtered_df.drop(columns=["clean_altitude_m", "clean_time"])
+
+
+def retain_longest_contiguous_segment(
+    flight_df: pd.DataFrame,
+    *,
+    gap_threshold_seconds: float,
+    minimum_observed_fraction: float,
+) -> pd.DataFrame:
+    filtered_df = flight_df.sort_values("time").copy()
+    if filtered_df.empty:
+        return filtered_df
+
+    filtered_df["segment_time"] = pd.to_datetime(filtered_df["time"], utc=True)
+    filtered_df["segment_gap_seconds"] = (
+        filtered_df["segment_time"].diff().dt.total_seconds().fillna(0)
+    )
+    filtered_df["segment_id"] = (
+        filtered_df["segment_gap_seconds"] > gap_threshold_seconds
+    ).cumsum()
+
+    segment_stats = (
+        filtered_df.groupby("segment_id", sort=False)["segment_time"]
+        .agg(["min", "max", "count"])
+        .rename(columns={"count": "row_count"})
+    )
+    segment_stats["observed_hours"] = (
+        segment_stats["max"] - segment_stats["min"]
+    ).dt.total_seconds() / 3600
+
+    best_segment_id = (
+        segment_stats.sort_values(
+            by=["observed_hours", "row_count"],
+            ascending=[False, False],
+        )
+        .index[0]
+    )
+    retained_df = filtered_df.loc[
+        filtered_df["segment_id"] == best_segment_id
+    ].copy()
+
+    duration_hours = pd.to_numeric(
+        pd.Series([retained_df["duration_hours"].iloc[0]]),
+        errors="coerce",
+    ).iloc[0]
+    if pd.notna(duration_hours) and duration_hours > 0:
+        observed_hours = segment_stats.loc[best_segment_id, "observed_hours"]
+        observed_fraction = float(observed_hours) / float(duration_hours)
+        if observed_fraction < minimum_observed_fraction:
+            return retained_df.iloc[0:0].copy()
+
+    return retained_df.drop(
+        columns=["segment_time", "segment_gap_seconds", "segment_id"]
+    )
+
+
+def apply_optional_trajectory_filters(
+    trajectory_df: pd.DataFrame,
+    config: RunConfig,
+) -> pd.DataFrame:
+    if trajectory_df.empty:
+        return trajectory_df
+
+    filtered_flights: list[pd.DataFrame] = []
+    for _, flight_df in trajectory_df.groupby("flight_key", sort=False, dropna=False):
+        filtered_flight_df = flight_df.sort_values("time").copy()
+        if config.apply_spike_filter:
+            filtered_flight_df = filter_flight_altitude_spikes(
+                filtered_flight_df,
+                minimum_deviation_m=config.spike_min_deviation_m,
+                max_window_seconds=config.spike_max_window_seconds,
+            )
+        if config.apply_gap_filter:
+            filtered_flight_df = retain_longest_contiguous_segment(
+                filtered_flight_df,
+                gap_threshold_seconds=config.gap_threshold_seconds,
+                minimum_observed_fraction=config.gap_min_observed_fraction,
+            )
+        if not filtered_flight_df.empty:
+            filtered_flights.append(filtered_flight_df)
+
+    if not filtered_flights:
+        return trajectory_df.iloc[0:0].copy()
+
+    return pd.concat(filtered_flights, ignore_index=True)
 
 
 def prepare_flight_for_altitude_plot(
@@ -1019,6 +1276,111 @@ def fetch_trajectories_step_2_scientific_db(
     return standardize_step_2_schema(trajectory_df)
 
 
+def get_step_1_flights_df(
+    config: RunConfig,
+    client: REST | Trino | ScientificDbClient | None = None,
+) -> pd.DataFrame:
+    created_client = client is None
+    if client is None:
+        client = make_backend_client(config.backend, config.database_url)
+
+    try:
+        if config.backend == "scientific_db":
+            assert isinstance(client, ScientificDbClient)
+            return fetch_flights_step_1_scientific_db(config, client)
+
+        if config.backend == "rest":
+            assert isinstance(client, REST)
+            flights_df = fetch_flights_step_1_rest(config, client)
+        else:
+            assert isinstance(client, Trino)
+            flights_df = fetch_flights_step_1_trino(config, client)
+
+        if flights_df.empty:
+            return flights_df
+        return prepare_long_haul_flights(
+            flights_df,
+            minimum_duration_hours=config.minimum_duration_hours,
+        )
+    finally:
+        if created_client:
+            del client
+
+
+def get_trajectory_df(
+    config: RunConfig,
+    client: REST | Trino | ScientificDbClient | None = None,
+) -> pd.DataFrame:
+    created_client = client is None
+    if client is None:
+        client = make_backend_client(config.backend, config.database_url)
+
+    try:
+        if config.backend == "scientific_db":
+            assert isinstance(client, ScientificDbClient)
+            trajectory_df = fetch_trajectories_step_2_scientific_db(config, client)
+            return apply_optional_trajectory_filters(trajectory_df, config)
+
+        if config.backend == "rest":
+            raise NotImplementedError(
+                "Programmatic in-memory trajectory retrieval is currently "
+                "implemented for scientific_db only. REST still uses the "
+                "CLI-oriented resumable file workflow."
+            )
+
+        raise NotImplementedError(
+            "Programmatic in-memory trajectory retrieval is currently "
+            "implemented for scientific_db only. Trino still uses the "
+            "CLI-oriented file workflow."
+        )
+    finally:
+        if created_client:
+            del client
+
+
+def get_scientific_trajectory_df(
+    *,
+    origin_airport: str = DEFAULT_ORIGIN_AIRPORT,
+    minimum_duration_hours: float = DEFAULT_MINIMUM_DURATION_HOURS,
+    start_time: str | None = None,
+    end_time: str | None = None,
+    database_url: str = DEFAULT_DATABASE_URL,
+    apply_spike_filter: bool = False,
+    spike_min_deviation_m: float = 200.0,
+    spike_max_window_seconds: float = 120.0,
+    apply_gap_filter: bool = False,
+    gap_threshold_seconds: float = 600.0,
+    gap_min_observed_fraction: float = 0.25,
+) -> pd.DataFrame:
+    resolved_start_time, resolved_end_time = resolve_time_window(
+        start_time,
+        end_time,
+        backend="scientific_db",
+        database_url=database_url,
+        origin_airport=origin_airport,
+    )
+    config = RunConfig(
+        backend="scientific_db",
+        step="both",
+        origin_airport=origin_airport,
+        start_time=resolved_start_time,
+        end_time=resolved_end_time,
+        minimum_duration_hours=minimum_duration_hours,
+        database_url=database_url,
+        save_step_1_csv=False,
+        save_step_2_csv=False,
+        plot_min_observed_fraction=MIN_PLOT_OBSERVED_HOURS_FRACTION,
+        apply_spike_filter=apply_spike_filter,
+        spike_min_deviation_m=spike_min_deviation_m,
+        spike_max_window_seconds=spike_max_window_seconds,
+        apply_gap_filter=apply_gap_filter,
+        gap_threshold_seconds=gap_threshold_seconds,
+        gap_min_observed_fraction=gap_min_observed_fraction,
+        paths=OutputPaths(),
+    )
+    return get_trajectory_df(config)
+
+
 def normalize_rest_track_dataframe(
     track_df: pd.DataFrame,
     flight: pd.Series,
@@ -1217,7 +1579,7 @@ def print_step_2_summary(
 def run_step_1_rest(
     config: RunConfig,
     client: REST,
-) -> None:
+) -> pd.DataFrame:
     print(
         f"--- Step 1 ({config.backend}): Fetching departed flights from "
         f"{config.origin_airport} ---"
@@ -1255,12 +1617,13 @@ def run_step_1_rest(
     )
     if config.save_step_1_csv:
         save_step_1_results(long_haul_flights, config.paths.step_1_output_path)
+    return long_haul_flights
 
 
 def run_step_1_trino(
     config: RunConfig,
     client: Trino,
-) -> None:
+) -> pd.DataFrame:
     print(
         f"--- Step 1 ({config.backend}): Fetching departed flights from "
         f"{config.origin_airport} ---"
@@ -1306,12 +1669,13 @@ def run_step_1_trino(
     )
     if config.save_step_1_csv:
         save_step_1_results(long_haul_flights, config.paths.step_1_output_path)
+    return long_haul_flights
 
 
 def run_step_1_scientific_db(
     config: RunConfig,
     client: ScientificDbClient,
-) -> None:
+) -> pd.DataFrame:
     print(
         f"--- Step 1 ({config.backend}): Loading long-haul flights from "
         f"local scientific DB for {config.origin_airport} ---"
@@ -1371,12 +1735,13 @@ def run_step_1_scientific_db(
         save_step_1_results(long_haul_flights, config.paths.step_1_output_path)
     else:
         print("Step 1 CSV export skipped for scientific_db.")
+    return long_haul_flights
 
 
 def run_step_2_rest(
     config: RunConfig,
     client: REST,
-) -> None:
+) -> pd.DataFrame:
     print("\n--- Step 2 (rest): Fetching trajectories from saved Step 1 results ---")
 
     long_haul_flights = load_step_1_results(config.paths.step_1_output_path)
@@ -1451,13 +1816,18 @@ def run_step_2_rest(
         time.sleep(TRACK_REQUEST_COOLDOWN_SECONDS)
 
     final_trajectory_df = load_step_2_results(config.paths.step_2_output_path)
+    final_trajectory_df = apply_optional_trajectory_filters(
+        final_trajectory_df,
+        config,
+    )
     print_step_2_summary(final_trajectory_df, config, stopped_early)
+    return final_trajectory_df
 
 
 def run_step_2_trino(
     config: RunConfig,
     client: Trino,
-) -> None:
+) -> pd.DataFrame:
     print("\n--- Step 2 (trino): Fetching trajectories from saved Step 1 results ---")
 
     long_haul_flights = load_step_1_results(config.paths.step_1_output_path)
@@ -1506,31 +1876,45 @@ def run_step_2_trino(
         )
 
     final_trajectory_df = load_step_2_results(config.paths.step_2_output_path)
+    final_trajectory_df = apply_optional_trajectory_filters(
+        final_trajectory_df,
+        config,
+    )
     print_step_2_summary(final_trajectory_df, config, stopped_early=False)
+    return final_trajectory_df
 
 
 def run_step_2_scientific_db(
     config: RunConfig,
     client: ScientificDbClient,
-) -> None:
+) -> pd.DataFrame:
     print(
         "\n--- Step 2 (scientific_db): Loading trajectories directly from "
         "local PostgreSQL ---"
     )
     try:
-        trajectory_df = fetch_trajectories_step_2_scientific_db(config, client)
+        raw_trajectory_df = fetch_trajectories_step_2_scientific_db(config, client)
     except Exception as exc:
         raise RuntimeError(
             "Scientific DB Step 2 failed. Check that the local PostgreSQL "
             "database exists, is reachable, and contains trajectory rows."
         ) from exc
 
-    if trajectory_df.empty:
+    if raw_trajectory_df.empty:
         print(
             "No trajectory rows returned by the local scientific DB for that "
             "origin, time window, and duration filter."
         )
-        return
+        return raw_trajectory_df
+
+    trajectory_df = apply_optional_trajectory_filters(raw_trajectory_df, config)
+
+    if trajectory_df.empty:
+        print(
+            "Trajectory rows were returned by the local scientific DB, but "
+            "none remained after applying the requested trajectory filters."
+        )
+        return trajectory_df
 
     matched_flights = trajectory_df["flight_key"].nunique()
     print(
@@ -1548,12 +1932,13 @@ def run_step_2_scientific_db(
         print("Step 2 CSV export skipped for scientific_db.")
 
     print_step_2_summary(trajectory_df, config, stopped_early=False)
+    return trajectory_df
 
 
 def run_step_1(
     config: RunConfig,
     client: REST | Trino | ScientificDbClient,
-) -> None:
+) -> pd.DataFrame:
     if config.backend == "scientific_db":
         assert isinstance(client, ScientificDbClient)
         run_step_1_scientific_db(config, client)
@@ -1570,7 +1955,7 @@ def run_step_1(
 def run_step_2(
     config: RunConfig,
     client: REST | Trino | ScientificDbClient,
-) -> None:
+) -> pd.DataFrame:
     if config.backend == "scientific_db":
         assert isinstance(client, ScientificDbClient)
         run_step_2_scientific_db(config, client)
@@ -1589,8 +1974,9 @@ def main() -> None:
     resolved_backend = resolve_backend(
         args.backend,
         database_url=args.database_url,
-        step=args.step,
+        step=args.step or DEFAULT_STEP,
     )
+    resolved_step = resolve_step(args.step, backend=resolved_backend)
     resolved_start_time, resolved_end_time = resolve_time_window(
         args.start_time,
         args.end_time,
@@ -1599,6 +1985,7 @@ def main() -> None:
         origin_airport=args.origin_airport,
     )
     args.backend = resolved_backend
+    args.step = resolved_step
     args.start_time = resolved_start_time
     args.end_time = resolved_end_time
     if resolved_backend != "scientific_db":

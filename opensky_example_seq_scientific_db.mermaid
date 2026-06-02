@@ -2,11 +2,15 @@ sequenceDiagram
     actor User
     participant CLI as opensky_example.py
     participant DB as Scientific PostgreSQL
+    participant Filter as In-memory trajectory filters
     participant Step1CSV as long_haul_flights.csv
     participant Step2CSV as long_distance_trajectories.csv
     participant Plot as flights_altitude_vs_time.png
 
     User->>CLI: Run script with --backend scientific_db
+    opt --step omitted
+        CLI-->>CLI: Resolve effective step to both
+    end
     CLI->>DB: Resolve actual flight window for selected origin if times omitted
     DB-->>CLI: min(firstseen), max(lastseen)
 
@@ -21,10 +25,16 @@ sequenceDiagram
 
     opt Step 2
         CLI->>DB: Query joined trajectories from scientific_flights + scientific_state_vectors
-        DB-->>CLI: Trajectory rows in memory
+        DB-->>CLI: Raw trajectory rows in memory
+        opt --apply-spike-filter and/or --apply-gap-filter
+            CLI->>Filter: Apply per-flight cleaning pipeline
+            Note over Filter: Local-consistency spike removal
+            Note over Filter: Gap split and best-segment retention
+            Filter-->>CLI: Cleaned trajectory rows in memory
+        end
         CLI-->>User: Print trajectory summary/sample
         opt --save-step-2-csv
-            CLI->>Step2CSV: Save normalized trajectory rows
+            CLI->>Step2CSV: Save trajectory rows after optional filtering
         end
         CLI->>Plot: Generate altitude vs time plot from in-memory trajectories
     end

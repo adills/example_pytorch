@@ -243,6 +243,12 @@ class OpenSkyExampleTestCase(unittest.TestCase):
             save_step_1_csv=save_step_1_csv,
             save_step_2_csv=save_step_2_csv,
             plot_min_observed_fraction=plot_min_observed_fraction,
+            apply_spike_filter=False,
+            spike_min_deviation_m=200.0,
+            spike_max_window_seconds=120.0,
+            apply_gap_filter=False,
+            gap_threshold_seconds=600.0,
+            gap_min_observed_fraction=0.25,
             paths=self.make_paths(tmpdir),
         )
 
@@ -251,7 +257,7 @@ class OpenSkyExampleTestCase(unittest.TestCase):
             args = opensky_example.parse_args()
 
         self.assertEqual(args.backend, "auto")
-        self.assertEqual(args.step, "1")
+        self.assertIsNone(args.step)
         self.assertEqual(args.origin_airport, opensky_example.DEFAULT_ORIGIN_AIRPORT)
         self.assertIsNone(args.start_time)
         self.assertIsNone(args.end_time)
@@ -261,9 +267,25 @@ class OpenSkyExampleTestCase(unittest.TestCase):
             args.plot_min_observed_fraction,
             opensky_example.MIN_PLOT_OBSERVED_HOURS_FRACTION,
         )
+        self.assertFalse(args.apply_spike_filter)
+        self.assertEqual(args.spike_min_deviation_m, 200.0)
+        self.assertEqual(args.spike_max_window_seconds, 120.0)
+        self.assertFalse(args.apply_gap_filter)
+        self.assertEqual(args.gap_threshold_seconds, 600.0)
+        self.assertEqual(args.gap_min_observed_fraction, 0.25)
         self.assertEqual(
             args.minimum_duration_hours,
             opensky_example.DEFAULT_MINIMUM_DURATION_HOURS,
+        )
+
+    def test_resolve_step_defaults_to_both_for_scientific_db(self) -> None:
+        self.assertEqual(
+            opensky_example.resolve_step(None, backend="scientific_db"),
+            "both",
+        )
+        self.assertEqual(
+            opensky_example.resolve_step(None, backend="trino"),
+            opensky_example.DEFAULT_STEP,
         )
 
     def test_resolve_backend_auto_prefers_scientific_db(self) -> None:
@@ -360,6 +382,21 @@ class OpenSkyExampleTestCase(unittest.TestCase):
             saved_df = pd.read_csv(config.paths.step_1_output_path)
             self.assertEqual(len(saved_df), 2)
             self.assertTrue((saved_df["source_backend"] == "scientific_db").all())
+
+    def test_get_step_1_flights_df_returns_scientific_db_frame(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = self.make_config(tmpdir, backend="scientific_db", step="1")
+            client = opensky_example.ScientificDbClient(config.database_url)
+
+            with mock.patch.object(
+                opensky_example,
+                "fetch_flights_step_1_scientific_db",
+                return_value=make_scientific_step_1_frame(),
+            ):
+                result = opensky_example.get_step_1_flights_df(config, client)
+
+            self.assertEqual(len(result), 2)
+            self.assertTrue((result["source_backend"] == "scientific_db").all())
 
     def test_run_step_2_rest_resume_skips_completed_flights(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -461,6 +498,161 @@ class OpenSkyExampleTestCase(unittest.TestCase):
             saved_df = pd.read_csv(config.paths.step_2_output_path)
             self.assertEqual(len(saved_df), 2)
             self.assertTrue((saved_df["source_backend"] == "scientific_db").all())
+
+    def test_get_trajectory_df_returns_scientific_db_frame(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = self.make_config(tmpdir, backend="scientific_db", step="2")
+            client = opensky_example.ScientificDbClient(config.database_url)
+            expected_df = make_scientific_track_frame(
+                make_scientific_step_1_frame().iloc[0]["flight_key"]
+            )
+
+            with mock.patch.object(
+                opensky_example,
+                "fetch_trajectories_step_2_scientific_db",
+                return_value=expected_df,
+            ):
+                result = opensky_example.get_trajectory_df(config, client)
+
+            pd.testing.assert_frame_equal(result.reset_index(drop=True), expected_df.reset_index(drop=True))
+
+    def test_get_scientific_trajectory_df_uses_convenience_wrapper(self) -> None:
+        expected_df = make_scientific_track_frame(
+            make_scientific_step_1_frame().iloc[0]["flight_key"]
+        )
+
+        with mock.patch.object(
+            opensky_example,
+            "resolve_time_window",
+            return_value=("2018-12-31 08:48:25", "2022-12-31 23:58:29"),
+        ), mock.patch.object(
+            opensky_example,
+            "get_trajectory_df",
+            return_value=expected_df,
+        ) as get_trajectory_df_mock:
+            result = opensky_example.get_scientific_trajectory_df(
+                origin_airport="EGLL",
+                minimum_duration_hours=6,
+            )
+
+        self.assertTrue(get_trajectory_df_mock.called)
+        pd.testing.assert_frame_equal(result.reset_index(drop=True), expected_df.reset_index(drop=True))
+
+    def test_filter_flight_altitude_spikes_drops_isolated_local_spike(self) -> None:
+        frame = pd.DataFrame(
+            {
+                "time": pd.to_datetime(
+                    [
+                        "2026-01-01 10:00:00",
+                        "2026-01-01 10:00:30",
+                        "2026-01-01 10:01:00",
+                    ],
+                    utc=True,
+                ),
+                "geoaltitude": [1000.0, 1600.0, 1010.0],
+                "baroaltitude": [950.0, 1550.0, 960.0],
+            }
+        )
+
+        result = opensky_example.filter_flight_altitude_spikes(
+            frame,
+            minimum_deviation_m=200.0,
+            max_window_seconds=120.0,
+        )
+
+        self.assertEqual(len(result), 2)
+        self.assertEqual(
+            list(pd.to_datetime(result["time"], utc=True)),
+            list(pd.to_datetime([frame.loc[0, "time"], frame.loc[2, "time"]], utc=True)),
+        )
+
+    def test_retain_longest_contiguous_segment_drops_short_sparse_segment(self) -> None:
+        frame = pd.DataFrame(
+            {
+                "flight_key": ["fk1"] * 4,
+                "time": pd.to_datetime(
+                    [
+                        "2026-01-01 10:00:00",
+                        "2026-01-01 10:05:00",
+                        "2026-01-01 12:00:00",
+                        "2026-01-01 12:03:00",
+                    ],
+                    utc=True,
+                ),
+                "duration_hours": [8.0] * 4,
+                "geoaltitude": [1000.0, 3000.0, 10000.0, 10100.0],
+                "baroaltitude": [900.0, 2900.0, 9900.0, 10000.0],
+            }
+        )
+
+        result = opensky_example.retain_longest_contiguous_segment(
+            frame,
+            gap_threshold_seconds=600.0,
+            minimum_observed_fraction=0.005,
+        )
+
+        self.assertEqual(len(result), 2)
+        self.assertEqual(
+            list(pd.to_datetime(result["time"], utc=True)),
+            list(pd.to_datetime(frame.iloc[:2]["time"], utc=True)),
+        )
+
+    def test_apply_optional_trajectory_filters_applies_spike_and_gap_filters(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = self.make_config(tmpdir, backend="scientific_db", step="2")
+            config = opensky_example.RunConfig(
+                backend=config.backend,
+                step=config.step,
+                origin_airport=config.origin_airport,
+                start_time=config.start_time,
+                end_time=config.end_time,
+                minimum_duration_hours=config.minimum_duration_hours,
+                database_url=config.database_url,
+                save_step_1_csv=config.save_step_1_csv,
+                save_step_2_csv=config.save_step_2_csv,
+                plot_min_observed_fraction=config.plot_min_observed_fraction,
+                apply_spike_filter=True,
+                spike_min_deviation_m=200.0,
+                spike_max_window_seconds=120.0,
+                apply_gap_filter=True,
+                gap_threshold_seconds=600.0,
+                gap_min_observed_fraction=0.005,
+                paths=config.paths,
+            )
+            frame = pd.DataFrame(
+                {
+                    "flight_key": ["fk1"] * 5,
+                    "time": pd.to_datetime(
+                        [
+                            "2026-01-01 10:00:00",
+                            "2026-01-01 10:00:30",
+                            "2026-01-01 10:01:00",
+                            "2026-01-01 12:00:00",
+                            "2026-01-01 12:03:00",
+                        ],
+                        utc=True,
+                    ),
+                    "geoaltitude": [1000.0, 1600.0, 1010.0, 10000.0, 10100.0],
+                    "baroaltitude": [950.0, 1550.0, 960.0, 9900.0, 10000.0],
+                    "duration_hours": [8.0] * 5,
+                }
+            )
+
+            result = opensky_example.apply_optional_trajectory_filters(frame, config)
+
+            self.assertEqual(len(result), 2)
+            self.assertEqual(
+                list(pd.to_datetime(result["time"], utc=True)),
+                list(
+                    pd.to_datetime(
+                        [
+                            "2026-01-01 12:00:00",
+                            "2026-01-01 12:03:00",
+                        ],
+                        utc=True,
+                    )
+                ),
+            )
 
     def test_select_altitude_for_plot_prefers_geoaltitude(self) -> None:
         frame = pd.DataFrame(
