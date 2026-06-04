@@ -17,6 +17,7 @@ tqdm = "*"
 pyopensky = "*"
 pandas = "*"
 psycopg = "*"
+ipympl = "*"
 
 [dev-packages]
 pytest = "*"
