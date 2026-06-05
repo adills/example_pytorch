@@ -1,5 +1,6 @@
 Pipfile.lock
 *.cpython-*.pyc
 *.DS_Store
+.DS_Store
 gan_data/
 opensky_results/*.csv
